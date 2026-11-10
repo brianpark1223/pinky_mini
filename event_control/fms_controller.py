@@ -5,17 +5,17 @@ one robot at a time, one shared HOME (수납대) with parking slots, and a state
 machine per robot. delivery_gui.py and robot_notifier.py read its status.
 
 Default dry_run:=true: virtual arrival after 2 seconds, no navigation goals.
-Real mode: fill POINTS, start each robot's Nav2 in its own namespace (/pinky_1, /pinky_2),
-localize both, then pass -p dry_run:=false.
+Real mode: provide measured points_json/file and home_slots_json/file,
+start namespaced Nav2, localize both, then explicitly call /delivery/arm.
 
 Per-robot state machine
   IDLE -> TO_STORE -> (DOCKING) -> WAIT_LOAD -> TO_STATION -> WAIT_RECEIVE -> TO_HOME -> IDLE
   WAIT_PICKUP : the pickup is used by the other robot; stopped where it is until it is free
   ERROR       : only this robot stops; retry resends the failed step, reset drops its task
-                (and sends it back to the 수납대 when there is nothing else to do)
 
 Services (std_srvs/srv/Trigger)
   /delivery/request_a, /delivery/request_b        shared queue
+  /delivery/arm, /delivery/disarm              enable dispatch / request Nav2 cancel
   /delivery/<robot>/loaded                         loading done at the pickup
   /delivery/<robot>/received                       parts taken out at the workstation
   /delivery/<robot>/retry, /delivery/<robot>/reset ERROR recovery
@@ -35,16 +35,20 @@ Parameters
   robots 'pinky_1,pinky_2' | dry_run true | map_frame 'map'
   nav_action '/{robot}/navigate_to_pose' | pose_topic '/{robot}/amcl_pose'
   nav_timeout 90.0 s | dry_run_travel 2.0 s
+  pose_timeout 3.0 s | cancel_timeout 5.0 s
+  pickup_clearance 0.8 m | station_clearance 0.6 m (real)
+  points_file JSON | home_slots_file JSON (both required in real two-robot mode)
   home_point 'HOME' | home_slot_offset 0.35 m (2nd robot parks this far to the left of HOME;
                       0 = both use HOME itself)
   docking false | dock_start '/{robot}/delivery/dock_start' | dock_topic '/{robot}/delivery/dock'
   dock_timeout 60.0 s | dry_run_dock 2.0 s
 
 Do not send competing goals from RViz while this controller is running.
-Stopping this process does not stop the robots: use each robot's own e-stop.
+The FMS cancellation service is not a hardware e-stop; keep the physical stop available.
 """
 import json
 import math
+import signal
 import time
 from collections import deque
 
@@ -54,6 +58,7 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
@@ -93,11 +98,18 @@ class Robot:
         self.dock_cli = None         # Trigger client
         self.goal_seq = 0            # bumps on every goal; stale callbacks ignored
         self.goal_handle = None
+        self.goal_pending = False
+        self.stop_reason = None
+        self.stop_callback = None
+        self.stop_started = None
         self.goal_pose = None        # (x, y, yaw) actually sent (HOME slot may differ)
+        self.goal_started_at = None
+        self.departure_started_at = None
         self.nav_deadline = None     # timeout (real) or virtual arrival (dry_run)
         self.dock_deadline = None
         self.distance_remaining = None
         self.pose = None             # (x, y) for allocation cost
+        self.pose_seen = None
         self.home_slot = None        # index of the HOME parking slot it uses
         self.wait_since = None       # entered WAIT_PICKUP
         self.go_home_when_free = False   # delivered, queue empty -> head home
@@ -113,7 +125,12 @@ class FmsController(Node):
         self.dry_travel = float(p('dry_run_travel', 2.0))
         self.home = p('home_point', 'HOME')
         self.home_offset = float(p('home_slot_offset', 0.35))
+        self.home_min_separation = float(p('home_min_separation', 0.5))
         self.docking = bool(p('docking', False))
+        self.pose_timeout = float(p('pose_timeout', 3.0))
+        self.cancel_timeout = float(p('cancel_timeout', 5.0))
+        self.pickup_clearance = float(p('pickup_clearance', 0.8))
+        self.station_clearance = float(p('station_clearance', 0.2 if self.dry_run else 0.6))
         self.dock_timeout = float(p('dock_timeout', 60.0))
         self.dry_dock = float(p('dry_run_dock', 2.0))
         nav_fmt = p('nav_action', '/{robot}/navigate_to_pose')
@@ -121,7 +138,66 @@ class FmsController(Node):
         dock_start_fmt = p('dock_start', '/{robot}/delivery/dock_start')
         dock_topic_fmt = p('dock_topic', '/{robot}/delivery/dock')
         names = [r.strip() for r in str(p('robots', 'pinky_1,pinky_2')).split(',') if r.strip()]
-        self.points = {k: tuple(v) for k, v in POINTS.items()}
+        points_json = str(p('points_json', '')).strip()
+        points_file = str(p('points_file', '')).strip()
+        if points_json and points_file:
+            raise ValueError('Specify either points_json or points_file')
+        if not self.dry_run and not (points_json or points_file):
+            raise ValueError('Real mode requires measured points_json or points_file')
+        if points_file:
+            with open(points_file, encoding='utf-8') as stream:
+                supplied = json.load(stream)
+        else:
+            supplied = json.loads(points_json) if points_json else POINTS
+        if not isinstance(supplied, dict) or set(supplied) != set(POINTS):
+            raise ValueError('points_json must contain exactly STORE, A, B and HOME')
+        self.points = {}
+        for name, values in supplied.items():
+            if not isinstance(values, (list, tuple)) or len(values) != 3:
+                raise ValueError(f'{name} must be [x, y, yaw]')
+            try:
+                pose = tuple(float(value) for value in values)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f'{name} requires measured numeric x, y and yaw') from exc
+            if not all(math.isfinite(value) for value in pose):
+                raise ValueError(f'{name} has a non-finite coordinate')
+            self.points[name] = pose
+        home_slots_json = str(p('home_slots_json', '')).strip()
+        home_slots_file = str(p('home_slots_file', '')).strip()
+        if home_slots_json and home_slots_file:
+            raise ValueError('Specify either home_slots_json or home_slots_file')
+        if not self.dry_run and len(names) > 1 and not (home_slots_json or home_slots_file):
+            raise ValueError('Real two-robot mode requires measured home_slots_file')
+        if home_slots_file:
+            with open(home_slots_file, encoding='utf-8') as stream:
+                raw_slots = json.load(stream)
+        else:
+            raw_slots = json.loads(home_slots_json) if home_slots_json else None
+        self.measured_home_slots = None
+        if raw_slots is not None:
+            if not isinstance(raw_slots, list) or len(raw_slots) != len(names):
+                raise ValueError('home slots must contain one [x, y, yaw] pose per robot')
+            self.measured_home_slots = []
+            for values in raw_slots:
+                if not isinstance(values, list) or len(values) != 3:
+                    raise ValueError('each home slot must be [x, y, yaw]')
+                try:
+                    pose = tuple(float(value) for value in values)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError('home slots require measured numeric coordinates') from exc
+                if not all(math.isfinite(value) for value in pose):
+                    raise ValueError('home slot has a non-finite coordinate')
+                self.measured_home_slots.append(pose)
+            for i, first in enumerate(self.measured_home_slots):
+                for second in self.measured_home_slots[i + 1:]:
+                    if math.hypot(first[0] - second[0], first[1] - second[1]) \
+                            < self.home_min_separation:
+                        raise ValueError('home slots are closer than home_min_separation')
+        if len(names) != len(set(names)) or not names or self.pose_timeout <= 0 \
+                or self.pickup_clearance <= 0 or self.station_clearance <= 0 \
+                or self.cancel_timeout <= 0 or self.nav_timeout <= 0 \
+                or self.home_min_separation <= 0 or self.home not in self.points:
+            raise ValueError('Invalid robot names or safety parameters')
 
         self.robots = {}
         for name in names:
@@ -135,12 +211,17 @@ class FmsController(Node):
                 self.create_subscription(PoseWithCovarianceStamped, pose_fmt.format(robot=name),
                                          lambda m, r=r: self.on_pose(r, m), 10)
             r.pose = self.home_slot_pose(len(self.robots))[:2] if self.dry_run else None
+            r.pose_seen = time.monotonic() if self.dry_run else None
             r.home_slot = len(self.robots)       # everyone starts parked at the 수납대
             self.robots[name] = r
 
         self.queue = deque()
         self.next_id = 1
         self.pickup = None           # robot name holding the pickup
+        self.station_owners = {name: None for name in STATIONS}
+        self.station_release_pending = set()
+        self.armed = self.dry_run
+        self.shutting_down = False
         self.last_wait_log = 0.0
 
         self.status_pub = self.create_publisher(String, 'delivery/status', 10)
@@ -149,6 +230,8 @@ class FmsController(Node):
             self.create_service(Trigger, f'delivery/request_{st.lower()}',
                                 lambda req, res, st=st: self.enqueue(st, res))
             for st in STATIONS]
+        self.srvs.append(self.create_service(Trigger, 'delivery/arm', self.arm))
+        self.srvs.append(self.create_service(Trigger, 'delivery/disarm', self.disarm))
         for name, r in self.robots.items():
             for srv, fn in (('loaded', self.loaded), ('received', self.received),
                             ('retry', self.retry), ('reset', self.reset)):
@@ -171,8 +254,57 @@ class FmsController(Node):
     def nav_ready(self, r):
         return self.dry_run or r.nav.server_is_ready()
 
+    def pose_ready(self, r):
+        return r.pose is not None and r.pose_seen is not None and (
+            self.dry_run or time.monotonic() - r.pose_seen <= self.pose_timeout)
+
+    def clear_of_pickup(self, r):
+        return self.pose_ready(r) and math.hypot(
+            r.pose[0] - self.points['STORE'][0], r.pose[1] - self.points['STORE'][1]
+        ) >= self.pickup_clearance
+
+    def pickup_area_clear(self, requesting):
+        return all(other is requesting or self.clear_of_pickup(other)
+                   for other in self.robots.values())
+
+    def clear_of_station(self, r, station):
+        pose = self.points[station]
+        return self.pose_ready(r) and math.hypot(r.pose[0] - pose[0], r.pose[1] - pose[1]) \
+            >= self.station_clearance
+
+    def station_area_clear(self, station):
+        return all(self.clear_of_station(r, station) for r in self.robots.values())
+
+    def arm(self, request, response):
+        response.success = not self.shutting_down and all(
+            self.pose_ready(r) and self.nav_ready(r)
+            and r.state not in MOVING_STATES and r.state != 'STOPPING'
+            and not r.goal_pending and r.goal_handle is None and r.stop_reason is None
+            for r in self.robots.values()) \
+            and self.pickup_area_clear(self.robots.get(self.pickup)) \
+            and all(self.station_area_clear(station) if owner is None
+                    else all(other.name == owner or self.clear_of_station(other, station)
+                             for other in self.robots.values())
+                    for station, owner in self.station_owners.items())
+        if response.success:
+            self.armed = True
+        response.message = 'FMS armed' if response.success else 'Nav2, localization, goals or shared areas not clear'
+        return response
+
+    def disarm(self, request, response):
+        self.armed = False
+        for r in self.robots.values():
+            if r.state in MOVING_STATES:
+                self.stop_goal(r, 'FMS disarmed',
+                               lambda r=r: self.fail(r, 'FMS disarmed; inspect robot and shared areas'))
+        response.success = True
+        response.message = 'FMS disarmed; cancel requested for active Nav2 goals'
+        return response
+
     def home_slot_pose(self, slot):
         """Parking slot i of the shared 수납대: slot 0 = HOME, slot 1 = home_slot_offset to its left."""
+        if self.measured_home_slots is not None:
+            return self.measured_home_slots[slot]
         x, y, yaw = self.points[self.home]
         if slot == 0 or self.home_offset == 0:
             return (x, y, yaw)
@@ -181,7 +313,10 @@ class FmsController(Node):
 
     def on_pose(self, r, msg):
         p = msg.pose.pose.position
+        if msg.header.frame_id != self.frame or not all(math.isfinite(v) for v in (p.x, p.y)):
+            return
         r.pose = (p.x, p.y)
+        r.pose_seen = time.monotonic()
 
     def publish_status(self):
         now = time.monotonic()
@@ -198,6 +333,8 @@ class FmsController(Node):
                 'target': None if r.state in ('IDLE', 'WAIT_PICKUP') else r.target,
                 'error': r.error,
                 'nav_ready': self.nav_ready(r),
+                'pose_ready': self.pose_ready(r),
+                'goal_pending': r.goal_pending,
                 'timeout_left': None if self.dry_run else left,
                 'distance_remaining': r.distance_remaining if r.state in MOVING_STATES else None,
                 'home': self.home,
@@ -206,6 +343,9 @@ class FmsController(Node):
             'robots': robots,
             'queue': list(self.queue),
             'pickup': self.pickup,
+            'pickup_clear': self.pickup is None and self.pickup_area_clear(None),
+            'stations': self.station_owners,
+            'armed': self.armed,
             'dry_run': self.dry_run,
             'points': {k: [round(c, 3) for c in v] for k, v in self.points.items()},
         }
@@ -215,13 +355,21 @@ class FmsController(Node):
     def tick(self):
         now = time.monotonic()
         for r in self.robots.values():
+            if r.stop_reason is not None and r.stop_started is not None \
+                    and now - r.stop_started > self.cancel_timeout and r.state == 'STOPPING':
+                r.state = 'ERROR'
+                r.error = 'Nav2 cancellation unconfirmed; keep robot and pickup locked'
+                self.get_logger().error(f'[{r.name}] {r.error}')
+            if r.state in MOVING_STATES and not self.dry_run and not self.pose_ready(r):
+                self.stop_goal(r, 'Localization stale during navigation',
+                               lambda r=r: self.fail(r, 'Localization stale during navigation'))
             if r.nav_deadline is not None and now >= r.nav_deadline and r.state in MOVING_STATES:
                 r.nav_deadline = None
                 if self.dry_run:
                     self.arrived(r)
                 else:
-                    self.cancel_goal(r)
-                    self.fail(r, f'Navigation timeout ({self.nav_timeout:.0f}s) to {r.target}')
+                    reason = f'Navigation timeout ({self.nav_timeout:.0f}s) to {r.target}'
+                    self.stop_goal(r, reason, lambda r=r, reason=reason: self.fail(r, reason))
             if r.dock_deadline is not None and now >= r.dock_deadline and r.state == 'DOCKING':
                 r.dock_deadline = None
                 if self.dry_run:
@@ -229,19 +377,40 @@ class FmsController(Node):
                 else:
                     self.fail(r, f'Docking timeout ({self.dock_timeout:.0f}s)')
 
+        for station, owner in self.station_owners.items():
+            if owner is not None and station in self.station_release_pending \
+                    and self.clear_of_station(self.robots[owner], station) \
+                    and self.robots[owner].stop_reason is None \
+                    and self.robots[owner].departure_started_at is not None \
+                    and self.robots[owner].pose_seen > self.robots[owner].departure_started_at:
+                self.station_owners[station] = None
+                self.station_release_pending.discard(station)
+
+        if not self.armed or self.shutting_down:
+            self.publish_status()
+            return
+
         # 1) hand new requests to free robots (task_allocation.assign decides who)
         free = {n: {'pose': r.pose, 'state': r.state} for n, r in self.robots.items()
-                if r.state in ('IDLE', 'TO_HOME') and r.current is None and self.nav_ready(r)}
-        if self.queue and free:
-            for name, task in task_allocation.assign(free, list(self.queue), self.points):
+                if r.state == 'IDLE' and r.current is None and self.nav_ready(r)
+                and self.pose_ready(r) and not r.goal_pending and r.goal_handle is None
+                and r.stop_reason is None}
+        available = [task for task in self.queue if self.station_owners[task['station']] is None
+                     and self.station_area_clear(task['station'])]
+        if available and free:
+            for name, task in task_allocation.assign(free, available, self.points):
+                if name not in free or task not in self.queue \
+                        or self.station_owners[task['station']] is not None:
+                    continue
                 r = self.robots[name]
+                del free[name]
                 self.queue.remove(task)
                 task = dict(task, robot=name)
+                self.station_owners[task['station']] = name
+                self.station_release_pending.discard(task['station'])
                 r.current = task
                 r.go_home_when_free = False
                 r.home_slot = None
-                if r.state == 'TO_HOME':
-                    self.log(r, 'New request: abandoning return to HOME')
                 self.log(r, f'Assigned {task}')
                 self.go_pickup(r)
         elif self.queue and now - self.last_wait_log > 5.0 and not free:
@@ -252,31 +421,47 @@ class FmsController(Node):
         # 2) pickup free -> let the next waiting robot in (task_allocation.pickup_order)
         if self.pickup is None:
             waiting = {n: {'pose': r.pose, 'since': r.wait_since, 'task': r.current}
-                       for n, r in self.robots.items() if r.state == 'WAIT_PICKUP'}
+                       for n, r in self.robots.items() if r.state == 'WAIT_PICKUP'
+                       and self.pose_ready(r) and self.nav_ready(r)}
             name = task_allocation.pickup_order(waiting, self.points)
             if name is not None:
                 self.go_pickup(self.robots[name])
 
-        # 3) delivered and nothing left to do -> back to the 수납대
+        # 3) Leave a completed station even when another request to that same
+        # station is queued; waiting there would deadlock its occupancy lock.
         for r in self.robots.values():
-            if r.state == 'IDLE' and r.go_home_when_free and not self.queue:
+            assignable = any(self.station_owners[task['station']] is None
+                             and self.station_area_clear(task['station']) for task in self.queue)
+            if r.state == 'IDLE' and r.go_home_when_free and not assignable \
+                    and self.pose_ready(r) and self.nav_ready(r):
                 r.go_home_when_free = False
                 self.go_home(r)
+
+        holder = self.robots.get(self.pickup)
+        clearance_since = None if holder is None else (
+            holder.departure_started_at if holder.departure_started_at is not None
+            else holder.goal_started_at if holder.state == 'ERROR' else None)
+        if holder is not None and holder.state in ('TO_STATION', 'WAIT_RECEIVE', 'TO_HOME', 'IDLE', 'ERROR') \
+                and holder.stop_reason is None and not holder.goal_pending \
+                and self.clear_of_pickup(holder) and clearance_since is not None \
+                and holder.pose_seen > clearance_since:
+            self.release_pickup(holder)
 
         self.publish_status()
 
     # ---------------------------------------------------------- shared places
     def go_pickup(self, r):
         """Drive to the pickup if it is free (and take it), else wait where it is."""
-        if self.pickup in (None, r.name):
+        if self.pickup in (None, r.name) and self.pose_ready(r) \
+                and self.pickup_area_clear(r) and self.nav_ready(r):
             self.pickup = r.name
             r.wait_since = None
             self.move(r, 'STORE', 'TO_STORE')
         else:
-            self.cancel_goal(r)              # stop (e.g. abandon the trip home)
             r.target = None
             r.distance_remaining = None
-            r.wait_since = time.monotonic()
+            if r.wait_since is None:
+                r.wait_since = time.monotonic()
             self.set_state(r, 'WAIT_PICKUP')
 
     def release_pickup(self, r):
@@ -292,6 +477,8 @@ class FmsController(Node):
 
     # -------------------------------------------------------------- navigation
     def move(self, r, location, state, pose=None):
+        if r.goal_pending or r.goal_handle is not None or r.stop_reason is not None:
+            raise RuntimeError(f'{r.name}: previous Nav2 goal is not resolved')
         r.goal_seq += 1
         seq = r.goal_seq
         r.target = location
@@ -300,6 +487,7 @@ class FmsController(Node):
         r.error = None
         r.distance_remaining = None
         r.goal_pose = pose or self.points[location]
+        r.goal_started_at = time.monotonic()
         self.set_state(r, state)
         self.log(r, f'Goal #{seq}: {location}')
 
@@ -318,54 +506,114 @@ class FmsController(Node):
         goal.pose.pose.orientation.z = math.sin(yaw / 2)
         goal.pose.pose.orientation.w = math.cos(yaw / 2)
         r.nav_deadline = time.monotonic() + self.nav_timeout
-        r.nav.send_goal_async(
-            goal, feedback_callback=lambda fb: self.nav_feedback(r, fb, seq)
-        ).add_done_callback(lambda fut: self.goal_response(r, fut, seq))
+        r.goal_pending = True
+        try:
+            r.nav.send_goal_async(
+                goal, feedback_callback=lambda fb: self.nav_feedback(r, fb, seq)
+            ).add_done_callback(lambda fut: self.goal_response(r, fut, seq))
+        except Exception as exc:  # noqa: BLE001
+            r.goal_pending = False
+            self.mark_uncertain(r, f'Nav2 send_goal failed: {exc}')
 
     def nav_feedback(self, r, msg, seq):
-        if seq == r.goal_seq:
+        if seq == r.goal_seq and r.stop_reason is None:
             r.distance_remaining = round(float(msg.feedback.distance_remaining), 2)
 
     def goal_response(self, r, future, seq):
         if seq != r.goal_seq:
             return  # superseded goal
+        r.goal_pending = False
         try:
             handle = future.result()
         except Exception as exc:  # noqa: BLE001
-            self.fail(r, f'send_goal failed: {exc}')
+            self.mark_uncertain(r, f'Nav2 goal acceptance unconfirmed: {exc}')
             return
         if not handle.accepted:
-            self.fail(r, f'Nav2 rejected goal to {r.target}')
+            if r.stop_reason is not None:
+                self.finish_stop(r)
+            else:
+                self.fail(r, f'Nav2 rejected goal to {r.target}')
             return
         r.goal_handle = handle
         handle.get_result_async().add_done_callback(lambda fut: self.nav_result(r, fut, seq))
+        if r.stop_reason is not None:
+            self.send_cancel(r)
 
     def nav_result(self, r, future, seq):
-        if seq != r.goal_seq or r.state not in MOVING_STATES:
-            return  # superseded, timed out, reset, or now waiting
+        if seq != r.goal_seq:
+            return
         try:
             result = future.result()
         except Exception as exc:  # noqa: BLE001
-            self.fail(r, f'get_result failed: {exc}')
+            self.mark_uncertain(r, f'Nav2 result unconfirmed: {exc}')
             return
         r.goal_handle = None
+        if r.stop_reason is not None:
+            self.finish_stop(r)
+            return
+        if r.state not in MOVING_STATES:
+            return
         if result.status == GoalStatus.STATUS_SUCCEEDED:
             self.arrived(r)
         else:
             self.fail(r, f'Navigation to {r.target} ended: status={result.status}')
 
-    def cancel_goal(self, r):
-        r.goal_seq += 1  # make pending callbacks stale
+    def mark_uncertain(self, r, message):
+        r.error = f'{message}; operator must verify stop'
+        r.state = 'ERROR'
         r.nav_deadline = None
+        r.stop_reason = 'Nav2 motion unconfirmed'
+        self.get_logger().error(f'[{r.name}] {r.error}')
+
+    def stop_goal(self, r, reason, on_stopped):
+        """Do not send another goal until Nav2 resolves this one."""
+        if r.stop_reason is not None:
+            return
+        r.nav_deadline = None
+        if self.dry_run or (not r.goal_pending and r.goal_handle is None):
+            on_stopped()
+            return
+        r.stop_reason = reason
+        r.stop_callback = on_stopped
+        r.stop_started = time.monotonic()
+        self.set_state(r, 'STOPPING')
+        self.send_cancel(r)
+
+    def send_cancel(self, r):
         if r.goal_handle is not None:
             self.log(r, 'Cancelling active Nav2 goal')
-            r.goal_handle.cancel_goal_async()
-            r.goal_handle = None
+            try:
+                r.goal_handle.cancel_goal_async().add_done_callback(
+                    lambda fut, r=r: self.cancel_response(r, fut))
+            except Exception as exc:  # noqa: BLE001
+                r.error = f'Nav2 cancel request failed: {exc}; stop unconfirmed'
+                self.get_logger().error(f'[{r.name}] {r.error}')
+
+    def cancel_response(self, r, future):
+        if r.stop_reason is None:
+            return
+        try:
+            response = future.result()
+            if not response.goals_canceling:
+                r.error = 'Nav2 rejected cancellation; waiting for goal result'
+        except Exception as exc:  # noqa: BLE001
+            r.error = f'Nav2 cancellation response failed: {exc}'
+
+    def finish_stop(self, r):
+        callback = r.stop_callback
+        r.stop_reason = None
+        r.stop_callback = None
+        r.stop_started = None
+        r.goal_handle = None
+        r.goal_pending = False
+        if callback is not None:
+            callback()
 
     def arrived(self, r):
         r.nav_deadline = None
         if self.dry_run and r.goal_pose is not None:
             r.pose = (r.goal_pose[0], r.goal_pose[1])      # real runs: pose from amcl_pose
+            r.pose_seen = time.monotonic()
         if r.state == 'TO_STORE':
             if self.docking:
                 self.start_docking(r)
@@ -419,11 +667,12 @@ class FmsController(Node):
         return response
 
     def loaded(self, r, response):
-        response.success = r.state == 'WAIT_LOAD'
+        response.success = self.armed and r.state == 'WAIT_LOAD' \
+            and self.pose_ready(r) and self.nav_ready(r)
         response.message = f'{r.name}: loading confirmed' if response.success \
-            else f'{r.name} is not waiting for loading (state={r.state})'
+            else f'{r.name}: FMS disarmed, Nav2/localization unavailable, or not waiting for loading (state={r.state})'
         if response.success:
-            self.release_pickup(r)
+            r.departure_started_at = time.monotonic()
             self.move(r, r.current['station'], 'TO_STATION')
         return response
 
@@ -433,6 +682,8 @@ class FmsController(Node):
             else f'{r.name} is not waiting for receipt (state={r.state})'
         if response.success:
             self.log(r, f'COMPLETED: {r.current}')
+            self.station_release_pending.add(r.current['station'])
+            r.departure_started_at = time.monotonic()
             r.current = None
             r.target = None
             r.go_home_when_free = True      # next tick: new task, or back to the 수납대
@@ -440,13 +691,21 @@ class FmsController(Node):
         return response
 
     def retry(self, r, response):
+        if not self.armed:
+            response.success = False
+            response.message = f'{r.name}: FMS disarmed'
+            return response
         if r.state != 'ERROR' or r.move_state is None:
             response.success = False
             response.message = f'{r.name}: nothing to retry (state={r.state})'
             return response
-        if not self.nav_ready(r):
+        if r.stop_reason is not None or r.goal_pending or r.goal_handle is not None:
             response.success = False
-            response.message = f'{r.name}: Nav2 action server still not ready'
+            response.message = f'{r.name}: previous Nav2 goal has not stopped'
+            return response
+        if not self.nav_ready(r) or not self.pose_ready(r):
+            response.success = False
+            response.message = f'{r.name}: Nav2 or localization not ready'
             return response
         response.success = True
         response.message = f'{r.name}: retrying {r.move_state} -> {r.target}'
@@ -466,42 +725,75 @@ class FmsController(Node):
         return response
 
     def reset(self, r, response):
+        if r.stop_reason is not None:
+            response.success = False
+            response.message = f'{r.name}: cancellation already in progress'
+            return response
         dropped = r.current
-        self.cancel_goal(r)
-        self.release_pickup(r)
+        self.stop_goal(r, 'Operator reset', lambda r=r, dropped=dropped:
+                       self.finish_reset(r, dropped))
+        response.success = True
+        response.message = f'{r.name}: reset requested; Nav2 stop must be confirmed'
+        return response
+
+    def finish_reset(self, r, dropped):
+        if self.pickup == r.name and self.clear_of_pickup(r) \
+                and r.goal_started_at is not None and r.pose_seen > r.goal_started_at:
+            self.release_pickup(r)
+        if dropped is not None and self.station_owners.get(dropped['station']) == r.name:
+            self.station_release_pending.add(dropped['station'])
+            r.departure_started_at = time.monotonic()
         r.current = None
         r.target = None
         r.move_state = None
         r.error = None
         r.dock_deadline = None
         r.wait_since = None
-        r.go_home_when_free = True       # free robot: next task, or back to the 수납대
+        r.go_home_when_free = False      # do not initiate another trip after a reset
         self.set_state(r, 'IDLE')
-        response.success = True
-        response.message = (f'{r.name}: reset. Dropped task: {dropped}. '
-                            f'{len(self.queue)} task(s) still queued.')
-        self.get_logger().warn(response.message)
-        return response
+        self.get_logger().warn(f'[{r.name}] reset completed. Dropped task: {dropped}')
 
     def fail(self, r, message):
         r.nav_deadline = None
         r.dock_deadline = None
         r.error = message
-        if r.state == 'TO_STORE':
-            self.release_pickup(r)   # not there yet: let the other robot use it
-        # DOCKING failed: it is physically at the pickup, keep it until retry/reset
+        if self.pickup == r.name and self.clear_of_pickup(r) and r.stop_reason is None \
+                and r.goal_started_at is not None and r.pose_seen > r.goal_started_at:
+            self.release_pickup(r)
         self.get_logger().error(f'[{r.name}] {message}')
         self.set_state(r, 'ERROR')
 
+    def safe_shutdown(self):
+        """Cancel tracked goals before ending the process; report unresolved stops."""
+        self.armed = False
+        self.shutting_down = True
+        for r in self.robots.values():
+            if r.state in MOVING_STATES:
+                self.stop_goal(r, 'Controller shutdown',
+                               lambda r=r: self.fail(r, 'Controller shutdown'))
+        deadline = time.monotonic() + self.cancel_timeout
+        while time.monotonic() < deadline and any(
+                r.goal_pending or r.goal_handle is not None for r in self.robots.values()):
+            rclpy.spin_once(self, timeout_sec=0.1)
+        for r in self.robots.values():
+            if r.goal_pending or r.goal_handle is not None or r.stop_reason is not None:
+                self.get_logger().error(
+                    f'[{r.name}] Nav2 stop unconfirmed at shutdown; use robot stop control')
+
 
 def main():
-    rclpy.init()
+    # Keep the ROS context alive after SIGINT/SIGTERM so Nav2 cancellation can be sent.
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    def terminate(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, terminate)
     node = FmsController()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
+        node.safe_shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
