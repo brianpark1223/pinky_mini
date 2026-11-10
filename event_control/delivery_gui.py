@@ -36,7 +36,9 @@ Parameters
     dock_speed 0.05 (m/s, refined from real dockings) | turn_speed 30 (deg/s)
     dock_approach 0.4 (m, Nav2 goal -> marker stop point, used before the marker is seen)
     dock_turn_after 0 (deg, extra turn after docking, e.g. 180 to face away from the marker)
-  pose_source 'auto' (auto = TF, falls back to amcl_pose | tf | amcl)
+  pose_source 'auto' (auto = TF, falls back to amcl_pose (+ odometry) | tf | amcl)
+  odom_topic '/odom' (per robot <ns>/odom; fills gaps between amcl_pose updates, '' = off)
+  pose_smooth 0.3 s (map display smoothing; 2 cm / 1 deg jitter ignored, jumps > 0.5 m snap; 0 = off)
   map_frame 'map' | base_frame 'auto' (<robot>/base_footprint, then base_footprint / base_link)
   pose_topic '/amcl_pose' | rviz_config '' (path to .rviz file)
   map_yaml '' (saved map, e.g. ~/maps/pinky.yaml: shown at once, replaced by /map when it arrives)
@@ -60,7 +62,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import PoseWithCovarianceStamped
-from nav_msgs.msg import OccupancyGrid, Path
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from tf2_ros import Buffer, TransformListener
@@ -475,13 +477,16 @@ class Track:
         self.amcl_pose, self.amcl_time = None, 0.0
         self.tf_pose, self.tf_stamp, self.tf_fresh, self.tf_error_logged = None, None, 0.0, False
         self.plan = []             # [(x, y), ...] in map frame
+        self.odom, self.odom_time = None, 0.0      # wheel odometry (odom frame)
+        self.amcl_ref_odom = None  # odometry when the last amcl_pose arrived
+        self.view_pose = None      # smoothed pose drawn on the map
         self.frame, self.frame_time = None, 0.0
         self.dock_fb, self.dock_fb_time, self.dock_run = None, 0.0, None
         self.leg_state, self.leg_start, self.leg_last, self.leg_dist = None, None, None, 0.0
         self.leg_dock_at = None
 
 
-TRACK_ATTRS = {'pose', 'pose_source', 'amcl_pose', 'amcl_time', 'tf_pose', 'tf_stamp', 'tf_fresh',
+TRACK_ATTRS = {'pose', 'pose_source', 'odom', 'odom_time', 'amcl_ref_odom', 'view_pose', 'amcl_pose', 'amcl_time', 'tf_pose', 'tf_stamp', 'tf_fresh',
                'tf_error_logged', 'plan', 'frame', 'frame_time', 'dock_fb', 'dock_fb_time', 'dock_run',
                'leg_state', 'leg_start', 'leg_last', 'leg_dist', 'leg_dock_at', 'base_frame'}
 
@@ -518,6 +523,8 @@ class GuiNode(Node):
         base_frame = p('base_frame', 'auto')   # auto: <robot>/base_footprint, base_footprint, base_link
         map_topic = p('map_topic', '/map')
         plan_topic = p('plan_topic', '/plan')
+        odom_topic = p('odom_topic', '/odom')      # fills the gaps between amcl_pose updates ('' = off)
+        self.pose_smooth = float(p('pose_smooth', 0.3))   # s, display smoothing (0 = off)
         dock_topic = p('dock_topic', 'delivery/dock')
         ns_fmt = p('robot_ns', '/{robot}')     # per-robot topics: <ns>/amcl_pose, <ns>/plan, ...
         map_yaml = p('map_yaml', 'auto')
@@ -571,6 +578,7 @@ class GuiNode(Node):
             ns = ns_fmt.format(robot=name).rstrip('/') if ns_fmt else ''
             topics = []   # (kind, topic): namespaced ones, plus the plain ones for the first robot
             for kind, plain, rel in (('pose', pose_topic, 'amcl_pose'), ('plan', plan_topic, 'plan'),
+                                     ('odom', odom_topic, (odom_topic or '').lstrip('/')),
                                      ('dock', dock_topic, 'delivery/dock'),
                                      ('cam', self.camera_topic, self.camera_topic.lstrip('/'))):
                 if not plain:
@@ -585,6 +593,9 @@ class GuiNode(Node):
                                              lambda m, t=tr: self.on_pose(m, t), 10)
                 elif kind == 'plan':
                     self.create_subscription(Path, topic, lambda m, t=tr: self.on_plan(m, t), 10)
+                elif kind == 'odom':
+                    self.create_subscription(Odometry, topic, lambda m, t=tr: self.on_odom(m, t),
+                                             qos_profile_sensor_data)
                 elif kind == 'dock':
                     self.create_subscription(String, topic, lambda m, t=tr: self.on_dock(m, t), 10)
                 elif topic.endswith('compressed'):
@@ -866,6 +877,23 @@ class GuiNode(Node):
         p = msg.pose.pose.position
         tr.amcl_pose = (p.x, p.y, self.yaw_of(msg.pose.pose.orientation))
         tr.amcl_time = time.monotonic()
+        tr.amcl_ref_odom = tr.odom if tr.odom is not None and tr.amcl_time - tr.odom_time < 0.5 else None
+
+    def on_odom(self, msg, track=None):
+        tr = track or self.main
+        p = msg.pose.pose.position
+        tr.odom = (p.x, p.y, self.yaw_of(msg.pose.pose.orientation))
+        tr.odom_time = time.monotonic()
+
+    @staticmethod
+    def compose(base, ref, cur):
+        """base pose moved by the odometry change ref -> cur (both in the odom frame)."""
+        dx, dy = cur[0] - ref[0], cur[1] - ref[1]
+        c, s_ = math.cos(-ref[2]), math.sin(-ref[2])
+        lx, ly = c * dx - s_ * dy, s_ * dx + c * dy            # motion in the robot frame at ref
+        c, s_ = math.cos(base[2]), math.sin(base[2])
+        yaw = base[2] + (cur[2] - ref[2])
+        return (base[0] + c * lx - s_ * ly, base[1] + s_ * lx + c * ly, math.atan2(math.sin(yaw), math.cos(yaw)))
 
     def update_pose(self):
         """Pick the pose to show for every robot (called ~10 Hz).
@@ -922,9 +950,35 @@ class GuiNode(Node):
         if tr.tf_pose is not None and now - tr.tf_fresh < 1.0:
             tr.pose, tr.pose_source = tr.tf_pose, 'TF'
         elif tr.amcl_pose is not None and self.pose_mode != 'tf':
-            tr.pose, tr.pose_source = tr.amcl_pose, 'AMCL'
+            if tr.amcl_ref_odom is not None and tr.odom is not None and now - tr.odom_time < 0.5:
+                # amcl_pose only comes after ~0.25 m / ~11 deg: fill the gap with wheel odometry
+                tr.pose, tr.pose_source = self.compose(tr.amcl_pose, tr.amcl_ref_odom, tr.odom), 'AMCL+odom'
+            else:
+                tr.pose, tr.pose_source = tr.amcl_pose, 'AMCL'
         elif tr.pose is not None:
             tr.pose_source = '끊김'
+        self._smooth_view(tr, now)
+
+    def _smooth_view(self, tr, now):
+        """Pose drawn on the map: follows tr.pose with a short lag, ignores tiny jitter, snaps on jumps."""
+        if tr.pose is None:
+            tr.view_pose = None
+            return
+        last = getattr(tr, '_view_t', None)
+        tr._view_t = now
+        v = tr.view_pose
+        if v is None or self.pose_smooth <= 0 or last is None:
+            tr.view_pose = tr.pose
+            return
+        dx, dy = tr.pose[0] - v[0], tr.pose[1] - v[1]
+        dyaw = math.atan2(math.sin(tr.pose[2] - v[2]), math.cos(tr.pose[2] - v[2]))
+        if math.hypot(dx, dy) > 0.5:                       # relocalised / teleported: no slow glide
+            tr.view_pose = tr.pose
+            return
+        if math.hypot(dx, dy) < 0.02 and abs(dyaw) < math.radians(1.0):
+            return                                          # jitter: keep still
+        k = 1.0 - math.exp(-max(0.0, now - last) / self.pose_smooth)
+        tr.view_pose = (v[0] + k * dx, v[1] + k * dy, v[2] + k * dyaw)
 
     def _learn_speed(self, now):
         """Average Nav2 speed over each finished driving leg (stops included), all robots."""
@@ -1292,7 +1346,7 @@ class MapWidget(QWidget):
         sel = self.win.selected if multi else None
         for name in robots:
             tr = self.node.tracks.get(name)
-            pose = tr.pose if tr else None
+            pose = (tr.view_pose or tr.pose) if tr else None
             if pose is None:
                 continue
             drawn += 1

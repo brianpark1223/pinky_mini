@@ -182,6 +182,10 @@ python3 delivery_gui.py --ros-args -p station_labels:='작업대1,작업대2' \
   갱신이 멈추면 `/amcl_pose`(약 25cm 이동마다 갱신)로 자동 전환합니다. 위치 타일에 `· TF` / `· AMCL` / `· 끊김`으로 표시되고,
   끊기면 지도의 로봇이 회색이 됩니다. Pinky의 기준 프레임이 다르면 `-p base_frame:=base_link`.
   확인: `ros2 run tf2_ros tf2_echo map base_footprint`
+- **떨림 줄이기**: TF가 없어 `amcl_pose`로 받을 때는 그 사이를 바퀴 오도메트리(`/odom`, 로봇별 `/<robot>/odom`)로 이어서
+  부드럽게 움직입니다(위치 타일 `· AMCL+odom`). 지도에 그리는 위치는 0.3초 정도 살짝 따라가게 하고, 2 cm·1° 이하 흔들림은 무시,
+  0.5 m 넘게 튀면(위치 재설정) 바로 이동합니다. 조절: `-p pose_smooth:=0.5`(더 부드럽게) / `0`(끄기), `-p odom_topic:=''`(오도메트리 끄기).
+  가장 좋은 건 로봇별 TF(`pinky_1/base_footprint`)를 쓰는 것입니다. TF는 AMCL과 오도메트리를 이미 합친 값이라 거의 떨리지 않습니다.
 - **저장된 지도 파일**: `-p map_yaml:=~/maps/pinky.yaml`을 주면 map_server 없이도 그 지도를 바로 그립니다
   (yaml 옆의 pgm/png를 map_server와 같은 규칙으로 읽음: occupied_thresh / free_thresh / negate / origin / resolution).
   로봇과 연결돼 `/map`이 들어오면 그 지도로 바꿉니다. 로봇의 map.yaml과 이미지 파일을 노트북에 함께 복사해 두세요.
@@ -292,6 +296,6 @@ ROS 없이 가짜 rclpy로 검증했습니다 (`python3 test_fms.py fms_controll
 - `test_fms.py` 48개 (2대 컨트롤러): 로봇별 서비스·Nav2·위치 구독, 요청 2건 분배, 픽업대 한 대씩(WAIT_PICKUP → 차례), 가까운 로봇 배정·위치 모르면 후순위·먼저 기다린 순, 복귀 중 새 요청, 한 대 오류여도 다른 한 대 계속, 오류 시 점유 해제/유지, 재시도·취소, 시간 초과, 남은 거리, 늦은 결과 무시, 도킹 시작·진행·실패·재시도·완료·서비스 없음, 수납대 자리 2개, 파라미터
 - `test_fsm.py` 26개: 상태 머신 전체 흐름, 복구, 타임아웃, Nav2 남은 거리 반영, 고정 지점·공용 수납대
 - `test_notifier.py` 21개: 2대일 때 자기 로봇 상태만 따라감, 전방 섹터 판정(측면/몸체/inf 무시, 각도 보정), 주행 중에만 삐빅, 목적지 근처 음소거, 쿨다운, 대기 상태 노래·반복·중지
-- `test_gui.py` 123개 + 컨트롤러 상태 연동 7개 (PyQt5, PyQt6 각각 통과) (`QT_QPA_PLATFORM=offscreen`): 상태별 버튼 활성화, 서비스 호출, 중복 요청, 요청 버튼 2초 잠금, 대기 안내 문구, 지도 변환·지도 파일(yaml+pgm) 읽기·표시용 지도 정리·회전·평면도 파일·탭별 지도, TF/AMCL 위치 전환, 새 요청 팝업·담당 Pinky 표시, 도착 시간 계산·멈춤·속도 학습, ArUco 도킹 시간(카메라 피드백·마커 놓침·피드백 끊김·도킹 속도 학습), 위치·카메라 표시, 작업대 칸의 수령 완료, Pinky 2대(로봇별 토픽·상태·도착 시간·배정 예상·픽업대 대기·로봇별 서비스·로봇 선택), 1대 컨트롤러로 되돌아가기, `fms_controller.py`가 실제로 보낸 상태로 화면·서비스 이름 확인 (`python3 test_fms.py fms_controller.py s.json` 후 `python3 test_gui.py delivery_gui.py /tmp s.json`)
+- `test_gui.py` 129개 + 컨트롤러 상태 연동 7개 (PyQt5, PyQt6 각각 통과) (`QT_QPA_PLATFORM=offscreen`): 상태별 버튼 활성화, 서비스 호출, 중복 요청, 요청 버튼 2초 잠금, 대기 안내 문구, 지도 변환·지도 파일(yaml+pgm) 읽기·표시용 지도 정리·회전·평면도 파일·탭별 지도, TF/AMCL 위치 전환·오도메트리로 사이 메우기·표시 떨림 보정, 새 요청 팝업·담당 Pinky 표시, 도착 시간 계산·멈춤·속도 학습, ArUco 도킹 시간(카메라 피드백·마커 놓침·피드백 끊김·도킹 속도 학습), 위치·카메라 표시, 작업대 칸의 수령 완료, Pinky 2대(로봇별 토픽·상태·도착 시간·배정 예상·픽업대 대기·로봇별 서비스·로봇 선택), 1대 컨트롤러로 되돌아가기, `fms_controller.py`가 실제로 보낸 상태로 화면·서비스 이름 확인 (`python3 test_fms.py fms_controller.py s.json` 후 `python3 test_gui.py delivery_gui.py /tmp s.json`)
 
 실제 ROS2/Nav2, Pinky 실물, 스피커 출력, 실제 카메라 토픽은 미검증입니다.
