@@ -157,7 +157,8 @@ class FmsController(Node):
 
         self.tick_timer = self.create_timer(0.2, self.tick)
         self.get_logger().info(f'Ready: robots={names}, dry_run={self.dry_run}, '
-                               f'docking={self.docking}, nav_timeout={self.nav_timeout}s')
+                               f'docking={self.docking}, nav_timeout={self.nav_timeout}s, '
+                               f'allocator={getattr(task_allocation, "SOURCE", "default")}')
 
     # ------------------------------------------------------------------ helpers
     def log(self, r, text):

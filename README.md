@@ -33,7 +33,7 @@ flowchart LR
     subgraph Laptop["관제 노트북"]
         GUI["관제 GUI<br/>delivery_gui.py"]
         FMS["FMS 컨트롤러<br/>fms_controller.py"]
-        ALLOC["작업 배정 규칙<br/>task_allocation.py"]
+        ALLOC["작업 배정 규칙<br/>task_allocation/allocator.py"]
     end
     subgraph P1["Pinky 1"]
         N1["Nav2"]
@@ -107,7 +107,7 @@ stateDiagram-v2
 | 항목 | 규칙 |
 |---|---|
 | 지점 | 모두 고정 좌표: 픽업대 `STORE`, 작업대1 `A`, 작업대2 `B`, 수납대 `HOME` |
-| 작업 배정 | 공용 대기열 하나. 비어 있는(대기 중이거나 수납대로 복귀 중인) Pinky 중 cost가 가장 낮은 로봇이 맡음 (`task_allocation.py`) |
+| 작업 배정 | 공용 대기열 하나. 비어 있는(대기 중이거나 수납대로 복귀 중인) Pinky 중 cost가 가장 낮은 로봇이 맡음 (`task_allocation/allocator.py`) |
 | 픽업대 | 한 번에 한 대. 출발할 때 점유하고 적재 완료로 떠날 때 풂. 차 있으면 다른 Pinky는 그 자리에서 대기 (`WAIT_PICKUP`) |
 | 수납대 | 1곳을 두 Pinky가 공유. 안에서 자리를 2개로 나눠 주차 (두 번째 자리는 0.35 m 옆) |
 | 사람 확인 | 적재 완료는 픽업대 담당자, 수령 완료는 요청한 작업자가 작업대에서 누름 |
@@ -143,7 +143,7 @@ stateDiagram-v2
 ├── event_control/
 │   ├── README.md          # 실행법과 실제 팀 인터페이스
 │   ├── fms_controller.py  # 2대용 FMS 컨트롤러
-│   ├── task_allocation.py # 기본 Cost 배정 및 픽업 순서
+│   ├── task_allocation.py # 외부 배정 모듈 연결 및 기본 규칙
 │   ├── parts_delivery.py  # 1대 시험용 컨트롤러
 │   ├── delivery_gui.py    # 관제 GUI
 │   ├── robot_notifier.py  # 로봇 알림
@@ -151,7 +151,9 @@ stateDiagram-v2
 │   ├── sounds/            # 알림음
 │   └── test_*.py          # ROS 모의 테스트
 ├── aruco_docking/         # 도킹 노드 추가 예정
-├── task_allocation/       # 배정 모듈 분리용 안내 (현재 코드는 event_control/)
+├── task_allocation/
+│   ├── README.md          # 배정 함수의 입력·출력 계약
+│   └── allocator.py       # Cost 배정 알고리즘 및 픽업 순서
 ├── config/                # 공통 설정 분리 예정
 ├── launch/                # ROS2 통합 실행 파일 추가 예정
 ├── tests/                 # 테스트 분리용 안내 (현재 테스트는 event_control/)
@@ -160,7 +162,8 @@ stateDiagram-v2
     └── images/            # GUI 화면 캡처
 ```
 
-배정 담당자는 현재 `event_control/task_allocation.py`의 `assign()`, `pickup_order()`를 수정합니다.
+배정 담당자는 `task_allocation/allocator.py`의 `assign()`, `pickup_order()`를 수정합니다.
+FMS는 `event_control/task_allocation.py` 연결부를 통해 호출하며, 모듈 로딩·실행 오류나 잘못된 반환값에는 기본 규칙을 사용합니다.
 ArUco 도킹 노드는 아직 포함되지 않았으며, 시작 서비스와 피드백 토픽으로 연결합니다.
 실제 모듈 간 약속은 [이벤트 제어 README의 팀 인터페이스](event_control/README.md#팀-인터페이스-이것만-지키면-각자-수정해도-연동됨)를 기준으로 합니다.
 
