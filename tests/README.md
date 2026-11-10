@@ -1,12 +1,15 @@
 # 테스트
 
-다음 동작을 검증하는 테스트를 추가합니다.
+현재 실행 가능한 테스트는 각 ROS 패키지와 함께 관리합니다.
 
-- 상태 전이와 적재·수령 확인 조건
-- Cost 기반 배정과 공용 대기열 처리
-- 픽업대 중복 사용 방지
-- 도킹 실패·주행 시간 초과·재시도·취소
-- 두 로봇과 GUI의 통합 동작
+- `pinky_mission/test/test_logic.py`: 여섯 경로, 방향, Costmap 검사
+- `pinky_mission/test/smoke_ros.py`: 클릭, Marker, 주행 차단, 저장·불러오기
 
-ROS 없이 실행하는 단위 테스트와 ROS2가 필요한 통합 테스트의 실행 방법을 구분해 기록합니다.
-현재 테스트 코드는 없습니다.
+```bash
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+python3 -m unittest discover -s pinky_mission/test -v
+ROS_DOMAIN_ID=68 python3 pinky_mission/test/smoke_ros.py
+```
+
+두 대 로봇 배정과 ArUco 도킹이 구현되면 이 디렉터리에 저장소 전체 통합 테스트를 추가합니다.

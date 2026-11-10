@@ -1,7 +1,9 @@
 # 공통 설정
 
-지점 좌표(`STORE`, `A`, `B`, `HOME`), 로봇 이름, 제한 시간과 공통 파라미터를 관리합니다.
+실행 설정은 중복을 피하기 위해 실제 ROS 패키지 안에서 관리합니다.
 
-실제 측정값을 확인한 뒤 YAML 설정 파일을 추가합니다.
-좌표에는 기준 프레임, 위치 단위, 각도 단위를 함께 명시합니다.
-현재 실행 가능한 설정 파일은 없습니다.
+- `pinky_mission/config/mission_params.yaml`
+- `pinky_mission/config/aruco_markers.yaml`
+- `pinky_mission/config/example_mission.json`
+
+두 대 로봇 namespace, 공용 픽업대 점유, FMS 제한 시간 등 저장소 전체 공통값이 필요해질 때 이 디렉터리에 별도 공통 설정을 추가합니다.

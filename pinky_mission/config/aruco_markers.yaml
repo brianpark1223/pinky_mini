@@ -1,0 +1,21 @@
+# Fixed ArUco ID to Pinky mission point mapping.
+# Dictionary, physical size, and map poses must be measured before localization.
+aruco_markers:
+  dictionary: DICT_5X5_100
+  markers:
+    66:
+      point_index: 1
+      role: standby
+      label: "1 待机"
+    24:
+      point_index: 2
+      role: pickup
+      label: "2 取货"
+    87:
+      point_index: 3
+      role: delivery_1
+      label: "3 送货一"
+    42:
+      point_index: 4
+      role: delivery_2
+      label: "4 送货二"
