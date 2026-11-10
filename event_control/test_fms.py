@@ -213,6 +213,28 @@ n=mk(dry_run=True, robots='a,b,c', nav_action='/{robot}/nav', home_slot_offset=0
 ok(list(n.robots)==['a','b','c'] and '/c/nav' in ACTIONS,'robots and nav_action params')
 ok(n.home_slot_pose(1)==n.home_slot_pose(0),'home_slot_offset 0 -> same HOME pose')
 
+
+# --- external allocator (task_allocation/allocator.py) through the bridge
+import os as _os, tempfile as _tf, importlib.util as _iu
+def _bridge(code):
+    d=_tf.mkdtemp(); f=_os.path.join(d,'allocator.py'); open(f,'w').write(code)
+    _os.environ['PINKY_ALLOCATOR']=f
+    sp=_iu.spec_from_file_location('ta_test', _os.path.join(_os.path.dirname(_os.path.abspath(sys.argv[1])),'task_allocation.py'))
+    m=_iu.module_from_spec(sp); sp.loader.exec_module(m); return m
+FREE={'pinky_1':{'pose':(0,0)},'pinky_2':{'pose':(5,5)}}; Q=[{'id':1,'station':'A'}]; PT={'STORE':(0,0,0)}
+m=_bridge("def assign(free, queue, points):\n    return [('pinky_2', queue[0])]\ndef pickup_order(w, p):\n    return sorted(w)[-1]")
+ok(m.SOURCE=='task_allocation/allocator.py' and m.assign(FREE,Q,PT)==[('pinky_2',Q[0])],'external allocator used')
+ok(m.pickup_order({'a':{'since':1},'b':{'since':2}},PT)=='b','external pickup_order used')
+m=_bridge("def assign(free, queue, points):\n    raise RuntimeError('bug')")
+ok(m.assign(FREE,Q,PT)==[('pinky_1',Q[0])],'allocator error -> default rules')
+m=_bridge("def assign(free, queue, points):\n    return [('ghost', queue[0])]")
+ok(m.assign(FREE,Q,PT)==[('pinky_1',Q[0])],'invalid robot name -> default rules')
+m=_bridge("def assign(free, queue, points):\n    return [('pinky_1', queue[0]), ('pinky_2', queue[0])]")
+ok(m.assign(FREE,Q,PT)==[('pinky_1',Q[0])],'duplicate task assignment -> default rules')
+m=_bridge("this is not python")
+ok(m.SOURCE=='default' and m.assign(FREE,Q,PT)==[('pinky_1',Q[0])],'broken file -> default rules')
+_os.environ['PINKY_ALLOCATOR']='/nonexistent/allocator.py'
+
 # --- status samples for the GUI check (python3 test_fms.py fms_controller.py out.json)
 if len(sys.argv) > 2:
     n=mk(dry_run=True, dry_run_travel=0.0, docking=True, dry_run_dock=0.0)
