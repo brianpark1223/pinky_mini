@@ -119,22 +119,29 @@ stateDiagram-v2
 
 ## 레포 구성
 
+현재 저장소에는 아래 기본 폴더와 안내 문서가 준비되어 있습니다.
+실행 코드와 ROS2 패키지 설정은 각 담당자가 추가할 예정입니다.
+아래 진행 상황 표는 제공된 프로젝트 문서 기준이며, 저장소 업로드 현황과는 별개입니다.
+
 ```
 .
-├── README.md              # 이 문서 (프로젝트 전체 설명)
-├── docs/images/           # README 화면 캡처
-└── event_control/         # 이벤트 제어: 상태 머신, 관제 GUI, 로봇 알림
-    ├── README.md          # 상세 사용법, 팀 인터페이스(토픽·서비스·상태 JSON 형식)
-    ├── parts_delivery.py  # FMS 컨트롤러 (현재 1대용)
-    ├── delivery_gui.py    # 관제 GUI (PyQt5 / PyQt6, 1대·2대 모두 지원)
-    ├── robot_notifier.py  # 로봇 알림음 · 전방 근접 경고음
-    ├── maps/              # 실습실 평면도 (화면 표시용)
-    ├── sounds/            # 알림음
-    └── test_*.py          # ROS 없이 동작 검증
+├── README.md
+├── event_control/         # FMS 상태 머신, GUI, 로봇 알림
+│   ├── README.md
+│   ├── maps/              # GUI 표시용 지도
+│   └── sounds/            # 알림음
+├── aruco_docking/         # 마커 인식, 정밀 정렬, 도킹
+├── task_allocation/       # Cost 계산, 작업 배정, 대기열
+├── config/                # 지점 좌표, 로봇 이름, 공통 파라미터
+├── launch/                # ROS2 통합 실행 파일 (추가 예정)
+├── tests/                 # 단위·통합 테스트 (추가 예정)
+└── docs/
+    ├── interfaces.md      # 팀 인터페이스 초안
+    └── images/            # README 화면 캡처
 ```
 
-ArUco 도킹과 작업 배정 코드는 각 담당자가 별도 폴더로 추가할 예정입니다.
-모듈 사이 약속(토픽·서비스·상태 형식)은 [`event_control/README.md`의 "팀 인터페이스"](event_control/README.md#팀-인터페이스-이것만-지키면-각자-수정해도-연동됨)에 정리되어 있습니다.
+모듈 사이 약속은 [팀 인터페이스 초안](docs/interfaces.md)에 정리합니다.
+토픽·서비스·메시지 형식은 팀에서 합의한 뒤 확정합니다.
 
 ## 실행
 

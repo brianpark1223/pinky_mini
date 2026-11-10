@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# ROS2 / colcon
+build/
+install/
+log/
+
+# Local settings and secrets
+.env
+.env.*
+!.env.example
+.DS_Store
