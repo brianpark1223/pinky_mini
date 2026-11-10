@@ -1,174 +1,238 @@
-# Pinky 부품 배송 및 RViz 미션 시스템
+# Pinky 부품 배송 FMS
 
-ROS 2 Jazzy, Nav2, RViz2를 기반으로 Pinky Pro 로봇의 지도 기반 배송 임무를 설정하고 실행하는 프로젝트입니다. 장기 목표는 두 대의 Pinky를 배정하는 소형 FMS이며, 현재 저장소에는 한 대의 로봇으로 검증한 RViz 미션 시스템과 관련 설정이 포함됩니다.
+작업대에서 부품을 요청하면 Pinky Pro 로봇 2대가 픽업대에서 부품을 싣고 작업대까지 가져다주는 **소형 부품 공급 FMS(Fleet Management System)** 입니다.
+ROS2 Jazzy + Nav2 기반이며, 3명이 3일 동안 진행한 팀 프로젝트입니다.
 
-## 현재 구현된 범위
+<p align="center">
+  <img src="docs/images/gui_request.png" width="80%" alt="관제 GUI - 작업 요청 화면">
+</p>
 
-- RViz2 `Publish Point` 도구로 네 지점 지정
-- `1 대기`, `2 픽업`, `3 배송 1`, `4 배송 2` Marker 표시
-- 고정 연결선 없이 지점만 표시하고 Nav2의 현재 계획 경로(`/plan`) 표시
-- RViz2 안에서 동작하는 Qt Mission Panel
-- Nav2 `/navigate_to_pose` Action을 이용한 순차 이동
-- 지도, TF, LiDAR, Costmap, Nav2 상태를 확인하는 주행 전 검사
-- 목표점 Costmap 통행 가능 여부 검사
-- 취소, 일시 정지(현재 Goal 취소), 재개, 임무 저장·불러오기
-- 대기 및 카메라 촬영 임무 확장 구조
-- ROS_DOMAIN_ID 42에서 노트북↔Pinky 양방향 DDS 통신 확인
-- 실습실 지도 `sesac_gangnam_20261110`
+## 무엇을 하나
 
-## 네 지점과 여섯 배송 경로
+1. 작업자가 **작업대**에서 [부품 요청]을 누릅니다.
+2. FMS가 비어 있는 Pinky 중 가장 알맞은 로봇에 작업을 배정합니다.
+3. Pinky가 **픽업대**로 가서 ArUco 마커를 보고 정확히 정렬해 섭니다.
+4. 픽업대 담당자가 부품을 싣고 [적재 완료]를 누릅니다.
+5. Pinky가 **작업대**로 배달하고, 요청한 작업자가 부품을 꺼낸 뒤 [수령 완료]를 누릅니다.
+6. 다음 요청이 있으면 이어서 처리하고, 없으면 **수납대**로 돌아갑니다.
 
-| 지점 | 역할 | ArUco ID |
-|---|---|---:|
-| 1 | 대기 위치 | 66 |
-| 2 | 픽업 위치 | 24 |
-| 3 | 배송 위치 1 | 87 |
-| 4 | 배송 위치 2 | 42 |
+로봇이 사람을 기다리는 동안(적재·수령)에는 로봇 스피커로 알림음이 나오고, 주행 중 앞에 사람이나 물체가 가까이 오면 경고음이 울립니다.
 
-| 모드 | 이동 순서 |
-|---:|---|
-| 1 | `1 → 2 → 3 → 1` |
-| 2 | `1 → 2 → 4 → 1` |
-| 3 | `1 → 2 → 3 → 4 → 1` |
-| 4 | `1 → 2 → 4 → 3 → 1` |
-| 5 | `1 → 2 → 3 → 2 → 4 → 1` |
-| 6 | `1 → 2 → 4 → 2 → 3 → 1` |
+## 팀 구성과 역할
 
-## ROS 2 노드
+| 역할 | 담당 내용 |
+|---|---|
+| **ArUco 주차 (도킹)** | 픽업대 앞 마커 인식, 거리·각도 계산, 정밀 정렬 주행, 도킹 완료 판단 |
+| **Cost 기반 작업 배정** | 요청을 어느 Pinky에 줄지(거리·대기 시간 cost), 대기열 우선순위, 픽업대·수납대 사용 순서 |
+| **이벤트 제어** | 로봇 상태 머신, 사람 입력(요청·적재·수령), 알림(소리·팝업), 오류·복구, 관제 GUI, 도착 시간 예측 |
 
-| 노드 | 구현 | 역할 |
+## 시스템 구성
+
+```mermaid
+flowchart LR
+    subgraph Laptop["관제 노트북"]
+        GUI["관제 GUI<br/>delivery_gui.py"]
+        FMS["FMS 컨트롤러<br/>fms_controller.py"]
+        ALLOC["작업 배정 규칙<br/>task_allocation.py"]
+    end
+    subgraph P1["Pinky 1"]
+        N1["Nav2"]
+        D1["ArUco 도킹"]
+        S1["알림<br/>robot_notifier.py"]
+    end
+    subgraph P2["Pinky 2"]
+        N2["Nav2"]
+        D2["ArUco 도킹"]
+        S2["알림<br/>robot_notifier.py"]
+    end
+    GUI -- "요청 · 적재 · 수령 (서비스)" --> FMS
+    FMS -- "누가 맡을지?" --> ALLOC
+    FMS -- "상태 JSON (0.2초마다)" --> GUI
+    FMS -- "목표 좌표" --> N1 & N2
+    FMS -- "도킹 시작" --> D1 & D2
+    D1 & D2 -- "거리 · 각도 · 완료" --> FMS
+    FMS -- "상태" --> S1 & S2
+```
+
+- 판단은 **FMS 컨트롤러 한 곳**에서만 합니다. GUI는 사람 입력을 전달하고 상태를 그리기만 하므로, GUI를 여러 대 켜도 화면이 어긋나지 않습니다.
+- 로봇마다 Nav2를 namespace(`/pinky_1`, `/pinky_2`)로 띄워 토픽을 구분합니다.
+
+## 로봇 상태 머신 (FSM)
+
+로봇마다 아래 FSM이 하나씩 돌고, FMS 컨트롤러가 그 위에서 작업 배정과 픽업대 순서를 정합니다.
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> TO_STORE: 작업 배정
+    TO_STORE --> WAIT_PICKUP: 픽업대 사용 중 (2대)
+    WAIT_PICKUP --> TO_STORE: 픽업대 비움
+    TO_STORE --> DOCKING: 픽업대 도착
+    DOCKING --> WAIT_LOAD: ArUco 정렬 완료
+    WAIT_LOAD --> TO_STATION: 적재 완료
+    TO_STATION --> WAIT_RECEIVE: 작업대 도착
+    WAIT_RECEIVE --> TO_STORE: 수령 완료 (대기열 있음)
+    WAIT_RECEIVE --> TO_HOME: 수령 완료 (대기열 없음)
+    TO_HOME --> TO_STORE: 새 요청
+    TO_HOME --> IDLE: 수납대 도착
+    TO_STORE --> ERROR: 주행 실패 / 시간 초과
+    TO_STATION --> ERROR: 주행 실패 / 시간 초과
+    TO_HOME --> ERROR: 주행 실패 / 시간 초과
+    DOCKING --> ERROR: 도킹 실패 / 시간 초과
+    ERROR --> TO_STORE: 재시도
+    ERROR --> DOCKING: 재시도
+    ERROR --> TO_STATION: 재시도
+    ERROR --> TO_HOME: 재시도
+    ERROR --> IDLE: 작업 취소
+```
+
+- 재시도는 실패했던 이동을 같은 목적지로 다시 보냅니다.
+- `WAIT_PICKUP`은 2대일 때, `DOCKING`은 ArUco 도킹을 켰을 때(`docking:=true`)만 생깁니다. 도킹을 끄면 픽업대 도착 즉시 `WAIT_LOAD`입니다.
+- 작업 취소는 현재 작업만 버리고, 대기열에 남은 요청은 그대로 처리합니다.
+
+| 상태 | 의미 | 로봇 알림 |
 |---|---|---|
-| `pinky_mission_manager` | Python / rclpy | 지점, 임무 순서, Nav2 Action, 상태, 안전 검사, 저장 |
-| `pinky_mission_panel_1` | C++ / rclcpp | RViz Panel 명령 발행 및 상태 표시 |
+| `IDLE` | 수납대에서 대기 | - |
+| `TO_STORE` | 픽업대로 이동 | 전방 근접 경고음 |
+| `DOCKING` | 픽업대 앞에서 ArUco 마커로 정렬 | - |
+| `WAIT_PICKUP` | 다른 Pinky가 픽업대를 쓰는 중이라 그 자리에서 차례 대기 | - |
+| `WAIT_LOAD` | 픽업대에서 적재 대기 | 알림음 |
+| `TO_STATION` | 작업대로 배달 | 전방 근접 경고음 |
+| `WAIT_RECEIVE` | 작업대에서 수령 대기 | 알림음 |
+| `TO_HOME` | 수납대로 복귀 | 전방 근접 경고음 |
+| `ERROR` | 그 로봇만 멈춤, 다른 로봇은 계속 동작 | - |
 
-ArUco 위치 인식 노드는 아직 구현하지 않았습니다. 현재는 ID 매핑과 카메라·보정 요구사항만 정리되어 있습니다. 실제 `aruco_localizer` 노드는 카메라 내참수, Marker 실측 크기, 각 Marker의 `map` 좌표를 확정한 뒤 추가해야 합니다.
+## 운영 규칙
 
-## 디렉터리
+| 항목 | 규칙 |
+|---|---|
+| 지점 | 모두 고정 좌표: 픽업대 `STORE`, 작업대1 `A`, 작업대2 `B`, 수납대 `HOME` |
+| 작업 배정 | 공용 대기열 하나. 비어 있는(대기 중이거나 수납대로 복귀 중인) Pinky 중 cost가 가장 낮은 로봇이 맡음 (`task_allocation.py`) |
+| 픽업대 | 한 번에 한 대. 출발할 때 점유하고 적재 완료로 떠날 때 풂. 차 있으면 다른 Pinky는 그 자리에서 대기 (`WAIT_PICKUP`) |
+| 수납대 | 1곳을 두 Pinky가 공유. 안에서 자리를 2개로 나눠 주차 (두 번째 자리는 0.35 m 옆) |
+| 사람 확인 | 적재 완료는 픽업대 담당자, 수령 완료는 요청한 작업자가 작업대에서 누름 |
+| 오류 | 주행·도킹 실패, 시간 초과 시 그 로봇만 `ERROR`. 다른 로봇은 계속 동작. GUI에서 재시도 또는 작업 취소 |
+
+## 관제 GUI
+
+탭 3개로 나뉩니다. 사용 위치에 따라 필요한 탭만 띄워 두면 됩니다.
+
+| 탭 | 사용자 | 기능 |
+|---|---|---|
+| ① 작업 요청 | 작업대 작업자 | 작업대별 [부품 요청]·[수령 완료], 로봇별 도착 예상 시간, 대기열과 담당 로봇 예상 |
+| ② 적재 확인 · 수령 현황 | 픽업대 담당자 | 로봇별 [적재 완료], 새 요청 팝업("pinky_2에 적재해 주세요") |
+| ③ Pinky 현재 상태 | 관리자 | 로봇 선택 → 상태·진행 단계·위치·카메라, 재시도/취소 |
+
+<p align="center">
+  <img src="docs/images/gui_load.png" width="49%" alt="적재 확인 화면">
+  <img src="docs/images/gui_status.png" width="49%" alt="Pinky 상태 화면">
+</p>
+
+- **실시간 지도:** 두 로봇의 위치(TF / AMCL)와 Nav2 경로를 실습실 평면도 위에 표시합니다.
+- **도착 시간 예측:** Nav2 남은 거리 + ArUco 정렬 시간 + 픽업대 대기 시간으로 계산하고, 주행할 때마다 실제 속도로 보정합니다. 사람이 싣고 꺼내는 동안에는 숫자가 멈춥니다.
+- **오클릭 방지:** 요청 버튼은 누른 뒤 2초 동안 잠기고, 확인 버튼은 해당 상태일 때만 켜집니다.
+
+## 파일 및 폴더 구조
+
+현재 실행 코드와 테스트는 `event_control/`에 모여 있습니다.
+공통 설정·launch·별도 테스트 폴더는 향후 분리를 위한 기본 구조입니다.
 
 ```text
 .
-├── pinky_mission/              # rclpy 미션 관리자 패키지
-├── pinky_mission_panel/        # RViz2 C++ Panel 패키지
-├── start_pinky_mission.sh      # 노트북 실행 스크립트
-├── event_control/maps/         # 저장한 OccupancyGrid 지도
-├── aruco_docking/              # ArUco 도킹·위치 인식 설계
-├── task_allocation/            # 경로 및 향후 다중 로봇 배정
-├── config/                     # 공통 설정 안내
-├── launch/                     # 통합 실행 안내
-├── tests/                      # 테스트 안내
-└── docs/interfaces.md          # 팀 인터페이스 초안
+├── README.md
+├── event_control/
+│   ├── README.md          # 실행법과 실제 팀 인터페이스
+│   ├── fms_controller.py  # 2대용 FMS 컨트롤러
+│   ├── task_allocation.py # 기본 Cost 배정 및 픽업 순서
+│   ├── parts_delivery.py  # 1대 시험용 컨트롤러
+│   ├── delivery_gui.py    # 관제 GUI
+│   ├── robot_notifier.py  # 로봇 알림
+│   ├── maps/              # 지도 YAML·PGM·표시용 평면도
+│   ├── sounds/            # 알림음
+│   └── test_*.py          # ROS 모의 테스트
+├── aruco_docking/         # 도킹 노드 추가 예정
+├── task_allocation/       # 배정 모듈 분리용 안내 (현재 코드는 event_control/)
+├── config/                # 공통 설정 분리 예정
+├── launch/                # ROS2 통합 실행 파일 추가 예정
+├── tests/                 # 테스트 분리용 안내 (현재 테스트는 event_control/)
+└── docs/
+    ├── interfaces.md      # 실제 인터페이스 문서 안내
+    └── images/            # GUI 화면 캡처
 ```
 
-패키지 내부에 필요한 launch, config, RViz 설정과 테스트를 함께 두었습니다. 루트의 기존 모듈 폴더에는 같은 파일을 복제하지 않고 실제 구현 위치를 안내합니다.
+배정 담당자는 현재 `event_control/task_allocation.py`의 `assign()`, `pickup_order()`를 수정합니다.
+ArUco 도킹 노드는 아직 포함되지 않았으며, 시작 서비스와 피드백 토픽으로 연결합니다.
+실제 모듈 간 약속은 [이벤트 제어 README의 팀 인터페이스](event_control/README.md#팀-인터페이스-이것만-지키면-각자-수정해도-연동됨)를 기준으로 합니다.
 
-## 빌드
+## 실행
 
-환경: Ubuntu 24.04, ROS 2 Jazzy, Nav2, RViz2, Python 3, Qt5
+아래 명령은 저장소의 `event_control/` 폴더에서 실행합니다.
+
+환경: Ubuntu 24.04, ROS2 Jazzy, Nav2, Python 3, PyQt5 또는 PyQt6
 
 ```bash
-mkdir -p ~/dev_ws/ros/src
-cd ~/dev_ws/ros/src
-git clone https://github.com/brianpark1223/pinky_mini.git
-cd ..
+# 각 Pinky: bringup + Nav2(지도 maps/sesac_gangnam_2.yaml) 실행 후, 알림 노드
+python3 robot_notifier.py --ros-args -p robot_name:=pinky_1   # 두 번째 로봇은 pinky_2
 
+# 관제 노트북 (로봇과 같은 ROS_DOMAIN_ID)
+python3 fms_controller.py                               # 모의 실행 (로봇이 움직이지 않음)
+python3 fms_controller.py --ros-args -p dry_run:=false  # 실제 주행
+python3 fms_controller.py --ros-args -p dry_run:=false -p docking:=true   # ArUco 도킹 포함
+PINKY_QT=6 python3 delivery_gui.py                      # PyQt6 사용 시
+```
+
+로봇 없이 확인하려면 `python3 test_fms.py fms_controller.py`, `QT_QPA_PLATFORM=offscreen python3 test_gui.py delivery_gui.py`를 실행합니다.
+자세한 설정과 문제 해결은 [`event_control/README.md`](event_control/README.md)를 보세요.
+
+## 진행 상황
+
+| 항목 | 상태 |
+|---|---|
+| 2대 FMS 컨트롤러 (로봇별 상태 머신, 픽업대 점유, 수납대 자리 나눔, 오류 격리) | 완료 (모의 실행 검증) |
+| 작업 배정 기본 규칙 (픽업대에 가장 가까운 로봇, 먼저 기다린 순) | 완료 · cost 고도화 진행 중 |
+| 관제 GUI (1대·2대, 도착 시간 예측, 실시간 지도) | 완료 |
+| 로봇 알림음 · 전방 근접 경고음 | 완료 |
+| ArUco 도킹 노드 (컨트롤러 연결부는 완료) | 진행 중 |
+| 실제 로봇 2대 통합 시험 | 예정 |
+
+## 한계와 확장 방향
+
+- 통로 교통 관제는 없고, 로봇끼리 마주치면 각자의 Nav2 장애물 회피에 맡깁니다.
+- 픽업대 차례를 기다리는 로봇은 그 자리에 멈추므로, 통로 한가운데서 기다릴 수 있습니다.
+- 대기열은 컨트롤러 메모리에만 있어 재시작하면 사라집니다.
+- 배터리·충전 관리, 고장 난 로봇의 작업을 다른 로봇으로 넘기는 기능은 없습니다.
+- 도착 시간에 사람이 싣고 꺼내는 시간은 포함하지 않습니다.
+
+## RViz2 대화형 단일 로봇 미션
+
+기존 2대 FMS와 별도로, 지도에서 직접 지점을 선택해 한 대의 Pinky를 검증하거나 임시 배송 경로를 실행할 수 있는 ROS 2 패키지를 함께 제공합니다. 코드를 중복하지 않도록 FMS는 `event_control/`, 대화형 RViz 임무는 아래 두 패키지로 분리했습니다.
+
+| 패키지 | 노드 | 역할 |
+|---|---|---|
+| `pinky_mission` | `pinky_mission_manager` (rclpy) | 지점, 경로, Nav2 Action, 안전 검사, 상태와 저장 |
+| `pinky_mission_panel` | `pinky_mission_panel_1` (rclcpp) | RViz2 안의 임무 설정·제어·상태 Panel |
+
+RViz `Publish Point`로 지정하는 네 지점은 `1 대기`, `2 픽업`, `3 배송 1`, `4 배송 2`입니다. 여섯 경로는 다음과 같습니다.
+
+1. `1 → 2 → 3 → 1`
+2. `1 → 2 → 4 → 1`
+3. `1 → 2 → 3 → 4 → 1`
+4. `1 → 2 → 4 → 3 → 1`
+5. `1 → 2 → 3 → 2 → 4 → 1`
+6. `1 → 2 → 4 → 2 → 3 → 1`
+
+빌드와 실행:
+
+```bash
+cd ~/dev_ws/ros
 source /opt/ros/jazzy/setup.bash
-colcon build --packages-select pinky_mission pinky_mission_panel
-```
+colcon build --packages-select pinky_mission pinky_mission_panel --symlink-install
 
-`colcon`은 저장소 아래의 두 ROS 패키지를 재귀적으로 찾습니다. 빌드 후에는 저장소 루트 또는 워크스페이스 루트에서 실행 스크립트를 사용할 수 있습니다.
-
-## 실행 순서
-
-### 1. Pinky: 하드웨어와 LiDAR
-
-```bash
-source /opt/ros/jazzy/setup.bash
-export ROS_DOMAIN_ID=42
-ros2 launch pinky_bringup bringup_robot.launch.xml
-```
-
-### 2. Pinky: 지도, AMCL, Nav2
-
-```bash
-source /opt/ros/jazzy/setup.bash
-export ROS_DOMAIN_ID=42
-ros2 launch pinky_navigation bringup_launch.xml \
-  map:=/home/pinky/maps/sesac_gangnam_20261110.yaml
-```
-
-### 3. 노트북: RViz 미션 시스템
-
-처음에는 주행 차단 상태로 확인합니다.
-
-```bash
-cd ~/dev_ws/ros/src/pinky_mini
-./start_pinky_mission.sh
-```
-
-현장 정지 수단과 Nav2 상태를 확인한 뒤 실제 주행을 허용합니다.
-
-```bash
+cd src/pinky_mini
+./start_pinky_mission.sh                  # 기본: 주행 차단
 ROS_DOMAIN_ID=42 ./start_pinky_mission.sh allow_motion:=true
 ```
 
-스크립트는 중복 실행을 잠금 파일로 차단합니다.
+실차 주행은 지도·TF·LaserScan·Costmap·Nav2와 현장 정지 수단을 확인한 뒤에만 허용합니다. 기본값 `allow_motion=false`에서는 지도 클릭이나 시작 버튼이 로봇을 움직이지 않습니다. 자세한 인터페이스와 검증 결과는 [`pinky_mission/README.md`](pinky_mission/README.md), [`pinky_mission/TEST_REPORT.md`](pinky_mission/TEST_REPORT.md)를 확인하세요.
 
-## RViz 사용
-
-1. 지도, TF, LaserScan, Costmap과 로봇 모델이 표시되는지 확인합니다.
-2. `2D Pose Estimate`로 실제 로봇의 초기 위치와 방향을 설정합니다.
-3. `Publish Point`로 대기, 픽업, 배송 1, 배송 2를 순서대로 클릭합니다.
-4. Mission Panel에서 배송 모드를 선택하고 `설정 적용`을 누릅니다.
-5. `Nav2`, `Map`, `Scan`, `Costmap`이 모두 정상이고 오류가 없을 때 임무를 시작합니다.
-
-`2D Goal Pose`는 이 미션 시스템에서 사용하지 않습니다. Mission Panel이 Nav2 Action Goal을 전송합니다.
-
-## 지도
-
-`event_control/maps/sesac_gangnam_20261110.yaml`과 `.pgm`은 2026-11-10에 저장한 지도입니다.
-
-- 해상도: 0.05 m/cell
-- 크기: 214 × 326
-- 원점: `[-7.981, -8.156, 0]`
-
-지도는 실제 운영 환경에 맞는지 확인한 후 사용해야 합니다.
-
-## 테스트
-
-```bash
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-
-python3 -m unittest discover -s pinky_mission/test -v
-ROS_DOMAIN_ID=68 python3 pinky_mission/test/smoke_ros.py
-```
-
-검증된 항목:
-
-- 여섯 배송 경로의 정확한 순서
-- 자동 Yaw 계산
-- Costmap 점유·미확인·경계 검사
-- 네 번의 `/clicked_point` 입력과 Marker 발행
-- 기본 주행 차단
-- 저장, 되돌리기, 불러오기
-- 두 ROS 패키지의 colcon 빌드
-
-실제 로봇에서 계속 확인할 항목:
-
-- 새 지도에서 AMCL 수렴과 장시간 주행
-- Nav2 취소 후 바퀴 정지 확인
-- 공용 Wi-Fi 장애 상황
-- 카메라 보정과 ArUco 기반 위치 추정
-- 두 대의 Pinky 통합 배정
-
-## 안전
-
-- `allow_motion=false`가 기본값입니다.
-- 지도 클릭만으로 로봇이 움직이지 않습니다.
-- 임무 실패 시 다음 지점으로 진행하지 않습니다.
-- 소프트웨어 취소는 하드웨어 비상 정지를 대신하지 않습니다.
-- 실차 시험 중에는 현장 감시자와 검증된 정지 수단이 필요합니다.
-
-## 기존 FMS 확장 계획
-
-기존 저장소의 `event_control`, `task_allocation`, `aruco_docking` 구조는 두 대의 로봇을 위한 FMS 확장 위치로 유지합니다. 픽업대 점유, 공용 대기열, Cost 기반 로봇 배정, 도킹 제어권 전환은 [팀 인터페이스 초안](docs/interfaces.md)을 기준으로 후속 구현합니다.
+ArUco 역할 매핑은 `66=대기`, `24=픽업`, `87=배송 1`, `42=배송 2`로 저장했습니다. 카메라 보정값, Marker 실측 크기와 고정 자세가 아직 확정되지 않았으므로 ArUco 위치 추정 노드는 포함하지 않습니다.

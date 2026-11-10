@@ -1,5 +1,9 @@
 # 작업 배정
 
-현재 한 대 로봇의 여섯 배송 경로 정의는 `pinky_mission/pinky_mission/logic.py`에 구현되어 있습니다. 동일한 경로 테이블을 이 디렉터리에 복제하지 않습니다.
+현재 구현은 [event_control/task_allocation.py](../event_control/task_allocation.py)에 있습니다.
+2대 FMS가 이 파일의 `assign()`과 `pickup_order()`를 호출합니다.
 
-이 디렉터리는 두 대 이상의 Pinky를 대상으로 거리, 대기 시간, 픽업대 점유 상태를 이용하는 Cost 기반 배정기와 공용 대기열을 추가할 위치입니다.
+- `assign()`: 요청 순서대로 픽업대까지 직선거리가 가장 짧은 가용 로봇에 배정
+- `pickup_order()`: 먼저 기다리기 시작한 로봇부터 픽업대 사용
+
+이 폴더는 향후 모듈 분리를 위한 위치입니다. 지금은 컨트롤러가 불러오는 위 파일을 수정합니다.
