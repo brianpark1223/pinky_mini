@@ -54,7 +54,7 @@ class Buffer:
 mod('tf2_ros', Buffer=Buffer, TransformListener=lambda *a, **k: None)
 mod('rclpy.time', Time=lambda: None)
 mod('geometry_msgs'); mod('geometry_msgs.msg', PoseWithCovarianceStamped=object)
-mod('nav_msgs'); mod('nav_msgs.msg', OccupancyGrid=object, Path=object)
+mod('nav_msgs'); mod('nav_msgs.msg', OccupancyGrid=object, Odometry=object, Path=object)
 mod('sensor_msgs'); mod('sensor_msgs.msg', CompressedImage=object, Image=object)
 mod('std_msgs'); mod('std_msgs.msg', String=object)
 mod('std_srvs'); mod('std_srvs.srv', Trigger=NS(Request=lambda: None))
@@ -525,6 +525,28 @@ ok(w.btn_retry.isEnabled() and '오류' in w.lbl_state.text(), 'ERROR enables re
 ok(not w.tabs.tabIcon(2).isNull() and w.tabs.tabIcon(1).isNull(), 'status tab dot on ERROR')
 ok(w.badge_load.text() == '완료', 'ERROR on way to station -> loaded done')
 shot(2, 'gui_error')
+# --- smoother pose: odometry between amcl updates, display smoothing
+import math as _m
+def _pm(x, y, yaw): return NS(pose=NS(pose=NS(position=NS(x=x, y=y), orientation=NS(x=0.0, y=0.0, z=_m.sin(yaw/2), w=_m.cos(yaw/2)))))
+TF['t'] = None
+ok('/odom' in node.subs and '/pinky_2/odom' in node.subs, 'odometry subscribed per robot')
+node.subs['/odom'](_pm(1.0, 0.0, 0.0))
+node.subs['/amcl_pose'](_pm(2.0, 3.0, _m.pi / 2))
+node.subs['/odom'](_pm(1.5, 0.0, 0.0))          # drove 0.5 m forward since that amcl_pose
+node.update_pose()
+ok(node.pose_source == 'AMCL+odom' and abs(node.pose[0] - 2.0) < 1e-6 and abs(node.pose[1] - 3.5) < 1e-6
+   and abs(node.pose[2] - _m.pi / 2) < 1e-6, 'amcl_pose + odometry since then (0.5 m forward while facing +y)')
+node.main.odom_time -= 1.0; node.update_pose()
+ok(node.pose_source == 'AMCL' and node.pose[:2] == (2.0, 3.0), 'stale odometry -> plain amcl_pose')
+tr = node.main
+tr.view_pose, tr._view_t, tr.pose = (0.0, 0.0, 0.0), 10.0, (0.1, 0.0, 0.0)
+node._smooth_view(tr, 10.1)
+ok(0.02 < tr.view_pose[0] < 0.04, 'display follows with a short lag (0.3 s)')
+v = tr.view_pose; tr.pose = (v[0] + 0.01, 0.0, 0.0); node._smooth_view(tr, 10.2)
+ok(tr.view_pose == v, 'jitter under 2 cm ignored')
+tr.pose = (5.0, 5.0, 0.0); node._smooth_view(tr, 10.3)
+ok(tr.view_pose == (5.0, 5.0, 0.0), 'jump > 0.5 m snaps')
+
 # --- real status from fms_controller.py (python3 test_fms.py fms_controller.py samples.json first)
 if len(sys.argv) > 3:
     samples = json.load(open(sys.argv[3]))
