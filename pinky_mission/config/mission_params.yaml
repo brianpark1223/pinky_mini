@@ -1,0 +1,12 @@
+pinky_mission_manager:
+  ros__parameters:
+    allow_motion: false
+    max_points: 4
+    footprint_radius: 0.14
+    costmap_max_age: 3.0
+    scan_max_age: 3.0
+    pose_max_age: 2.0
+    goal_timeout: 180.0
+    camera_topic: /camera/image_raw
+    photo_dir: ~/Pictures/pinky_mission
+    mission_file: ~/.config/pinky_mission/mission.json

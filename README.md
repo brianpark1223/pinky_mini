@@ -202,3 +202,37 @@ PINKY_QT=6 python3 delivery_gui.py                      # PyQt6 사용 시
 - 대기열은 컨트롤러 메모리에만 있어 재시작하면 사라집니다.
 - 배터리·충전 관리, 고장 난 로봇의 작업을 다른 로봇으로 넘기는 기능은 없습니다.
 - 도착 시간에 사람이 싣고 꺼내는 시간은 포함하지 않습니다.
+
+## RViz2 대화형 단일 로봇 미션
+
+기존 2대 FMS와 별도로, 지도에서 직접 지점을 선택해 한 대의 Pinky를 검증하거나 임시 배송 경로를 실행할 수 있는 ROS 2 패키지를 함께 제공합니다. 코드를 중복하지 않도록 FMS는 `event_control/`, 대화형 RViz 임무는 아래 두 패키지로 분리했습니다.
+
+| 패키지 | 노드 | 역할 |
+|---|---|---|
+| `pinky_mission` | `pinky_mission_manager` (rclpy) | 지점, 경로, Nav2 Action, 안전 검사, 상태와 저장 |
+| `pinky_mission_panel` | `pinky_mission_panel_1` (rclcpp) | RViz2 안의 임무 설정·제어·상태 Panel |
+
+RViz `Publish Point`로 지정하는 네 지점은 `1 대기`, `2 픽업`, `3 배송 1`, `4 배송 2`입니다. 여섯 경로는 다음과 같습니다.
+
+1. `1 → 2 → 3 → 1`
+2. `1 → 2 → 4 → 1`
+3. `1 → 2 → 3 → 4 → 1`
+4. `1 → 2 → 4 → 3 → 1`
+5. `1 → 2 → 3 → 2 → 4 → 1`
+6. `1 → 2 → 4 → 2 → 3 → 1`
+
+빌드와 실행:
+
+```bash
+cd ~/dev_ws/ros
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select pinky_mission pinky_mission_panel --symlink-install
+
+cd src/pinky_mini
+./start_pinky_mission.sh                  # 기본: 주행 차단
+ROS_DOMAIN_ID=42 ./start_pinky_mission.sh allow_motion:=true
+```
+
+실차 주행은 지도·TF·LaserScan·Costmap·Nav2와 현장 정지 수단을 확인한 뒤에만 허용합니다. 기본값 `allow_motion=false`에서는 지도 클릭이나 시작 버튼이 로봇을 움직이지 않습니다. 자세한 인터페이스와 검증 결과는 [`pinky_mission/README.md`](pinky_mission/README.md), [`pinky_mission/TEST_REPORT.md`](pinky_mission/TEST_REPORT.md)를 확인하세요.
+
+ArUco 역할 매핑은 `66=대기`, `24=픽업`, `87=배송 1`, `42=배송 2`로 저장했습니다. 카메라 보정값, Marker 실측 크기와 고정 자세가 아직 확정되지 않았으므로 ArUco 위치 추정 노드는 포함하지 않습니다.

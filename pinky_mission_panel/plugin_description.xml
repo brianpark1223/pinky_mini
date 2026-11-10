@@ -1,0 +1,5 @@
+<library path="pinky_mission_panel">
+  <class name="pinky_mission_panel/MissionPanel" type="pinky_mission_panel::MissionPanel" base_class_type="rviz_common::Panel">
+    <description>Pinky waypoint mission control</description>
+  </class>
+</library>
