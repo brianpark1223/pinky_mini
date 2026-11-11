@@ -1,13 +1,14 @@
 # 이벤트 제어: FMS 컨트롤러 · 관제 GUI · 로봇 알림 (v5 · Pinky 2대)
 
 ROS2 Jazzy / Python3. 의존 패키지: rclpy, nav2_msgs, action_msgs, std_msgs, std_srvs, sensor_msgs, geometry_msgs.
-**Pinky 2대는 `fms_controller.py`** 로 운영합니다. `parts_delivery.py`는 로봇 1대로 시험할 때 쓰는 1대용 컨트롤러입니다.
-두 컨트롤러의 `POINTS`는 예시 좌표입니다. 실물 모드 전에 실제 map 좌표로 바꾸세요(두 파일 모두).
+**Pinky 2대는 `fms_controller.py`(기본 실주행 모드)** 로 운영합니다. 로봇 없이 흐름을 시험할 때는 **`fms_sim.py`(모의 실행)** 를 사용합니다. 실주행은 실측 좌표 파일과 `/delivery/arm`이 필요합니다. `parts_delivery.py`는 로봇 1대로 시험할 때 쓰는 1대용 컨트롤러입니다.
+`POINTS`는 예시 좌표입니다. 2대용 실주행에는 아래 설명대로 실측 좌표·HOME 주차 위치 파일을 제공하고, 1대용은 `parts_delivery.py`의 좌표를 실제 map 좌표로 바꾸세요.
 
 ## 파일 구성과 실행 위치
 
 | 파일 | 메모 번호 | 실행 위치 | 역할 |
 |---|---|---|---|
+| `fms_sim.py` | - | 노트북 | **모의 실행**: 동일 컨트롤러를 `dry_run:=true`로 실행, Nav2 주행 goal을 보내지 않음 |
 | `fms_controller.py` | - | 노트북 | **2대용 FMS 컨트롤러**: 로봇별 상태 머신, 로봇별 Nav2, 픽업대 점유, 수납대 자리 나눔, ArUco 도킹 연결 |
 | `task_allocation.py` | - | (컨트롤러가 불러씀) | **작업 배정 연결부**: 레포의 `task_allocation/allocator.py`(cost 알고리즘)가 있으면 그걸 쓰고, 없거나 오류면 기본 규칙(가까운 로봇 · 먼저 온 순) 사용 |
 | `parts_delivery.py` | 1, 4(로직), 6 | 로봇 또는 노트북 | 1대용 컨트롤러 (로봇 한 대 시험용) |
@@ -231,7 +232,8 @@ python3 delivery_gui.py --ros-args -p station_labels:='작업대1,작업대2' \
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-python3 fms_controller.py                 # Pinky 2대 모의 실행 (로봇이 움직이지 않음)
+python3 fms_sim.py                        # Pinky 2대 모의 실행 (로봇이 움직이지 않음)
+# python3 fms_sim.py --ros-args -p dry_run_travel:=5.0  # 가상 이동 시간 변경
 # python3 parts_delivery.py               # 1대용
 ```
 
@@ -251,14 +253,14 @@ ros2 service call /delivery/pinky_1/received std_srvs/srv/Trigger '{}'
 
 1. `points.template.json`과 `home_slots.template.json`을 복사해 STORE, A, B, HOME 및 로봇별 HOME 주차 위치의 **실측** 지도 좌표(x m, y m, yaw rad)를 채웁니다. 두 주차 위치는 `home_min_separation`(기본 0.5 m)보다 떨어져야 합니다. 원본 예시 좌표와 기본 `home_slot_offset`은 실주행에 사용할 수 없습니다. 접근 가능한 free space, 로봇 외형과 목표 방향을 현장에서 확인합니다.
 2. 각 Pinky의 SLAM/지도·Nav2를 namespace(`/pinky_1`, `/pinky_2`)로 실행하고, 로봇마다 map 좌표 위치를 확인합니다. 두 차가 같은 지도 좌표계를 사용해야 합니다. `ros2 action list -t`에서 두 `NavigateToPose` action, `ros2 topic list -t`에서 두 `amcl_pose`가 보여야 합니다.
-3. 모의 실행 프로세스를 종료합니다. 같은 컨트롤러를 중복 실행하지 마세요. 실차는 안전 담당자가 물리적 정지 수단을 확보한 뒤에만 진행합니다.
+3. 모의 실행(`fms_sim.py`) 프로세스를 종료합니다. 같은 컨트롤러를 중복 실행하지 마세요. 실차는 안전 담당자가 물리적 정지 수단을 확보한 뒤에만 진행합니다.
 
 ```bash
-python3 fms_controller.py --ros-args -p dry_run:=false \
+python3 fms_controller.py --ros-args \
     -p points_file:=/absolute/path/to/measured_points.json \
     -p home_slots_file:=/absolute/path/to/measured_home_slots.json -p docking:=false
 # 로봇 이름 / Nav2 action 이름 / 위치 토픽이 다를 때
-python3 fms_controller.py --ros-args -p dry_run:=false -p robots:=pinky_a,pinky_b \
+python3 fms_controller.py --ros-args -p robots:=pinky_a,pinky_b \
     -p points_file:=/absolute/path/to/measured_points.json \
     -p home_slots_file:=/absolute/path/to/measured_home_slots.json \
     -p nav_action:='/{robot}/navigate_to_pose' -p pose_topic:='/{robot}/amcl_pose'
@@ -304,6 +306,8 @@ ros2 service call /delivery/reset std_srvs/srv/Trigger '{}'
 ## 검증 범위
 
 ROS 없이 가짜 rclpy로 검증했습니다 (`python3 test_fms.py fms_controller.py` 등).
+- `test_sim.py`: 모의 실행 진입점의 기본 설정·옵션 전달·ROS 인자 종료 구분자 처리 검증. 저장소 루트에서 `python3 -m unittest discover -s event_control -p test_sim.py`로 실행합니다.
+- `test_fms.py`는 기본 실주행 모드의 좌표 설정 요구·출발 허용 전 goal 차단·모의 실행 인자 전달·종료 시 취소 처리도 검증합니다.
 - `test_fms.py` (2대 컨트롤러, 외부 배정 모듈 사용·오류·중복 배정 시 기본 규칙 포함): 로봇별 서비스·Nav2·위치 구독, 요청 2건 분배, 픽업대 한 대씩(WAIT_PICKUP → 차례), 가까운 로봇 배정·위치 모르면 후순위·먼저 기다린 순, 복귀 중 새 요청, 한 대 오류여도 다른 한 대 계속, 오류 시 점유 해제/유지, 재시도·취소, 시간 초과, 남은 거리, 늦은 결과 무시, 도킹 시작·진행·실패·재시도·완료·서비스 없음, 수납대 자리 2개, 파라미터
 - `test_fsm.py` 26개: 상태 머신 전체 흐름, 복구, 타임아웃, Nav2 남은 거리 반영, 고정 지점·공용 수납대
 - `test_notifier.py` 21개: 2대일 때 자기 로봇 상태만 따라감, 전방 섹터 판정(측면/몸체/inf 무시, 각도 보정), 주행 중에만 삐빅, 목적지 근처 음소거, 쿨다운, 대기 상태 노래·반복·중지

@@ -104,6 +104,21 @@ def ok(c,msg):
 def st(n): n.publish_status(); return json.loads(STATUS[-1])
 def S(n): return {k: r.state for k, r in n.robots.items()}
 
+# --- default real mode stays disarmed and requires measured configuration
+PARAMS.clear()
+try:
+    fms.FmsController()
+    raise AssertionError('default real mode accepted missing configuration')
+except ValueError:
+    print('PASS default real mode refuses missing measured coordinates')
+PARAMS.update(points_json=json.dumps(fms.POINTS),
+              home_slots_json=json.dumps([[0.6,0.2,1.57],[1.4,0.2,1.57]]))
+ACTIONS.clear()
+n=fms.FmsController()
+ok(n.dry_run is False and n.armed is False, 'default controller is real mode and disarmed')
+n.call('delivery/request_a'); n.tick()
+ok(all(not a.sent for a in ACTIONS.values()), 'default real mode sends no goals before arm')
+
 # --- interface
 n=mk(dry_run=True, dry_run_travel=0.0)
 ok(list(n.robots)==['pinky_1','pinky_2'],'two robots by default')
@@ -339,6 +354,24 @@ ok(m.assign(FREE,Q,PT)==[('pinky_1',Q[0])],'duplicate task assignment -> default
 m=_bridge("this is not python")
 ok(m.SOURCE=='default' and m.assign(FREE,Q,PT)==[('pinky_1',Q[0])],'broken file -> default rules')
 _os.environ['PINKY_ALLOCATOR']='/nonexistent/allocator.py'
+
+# --- launcher arguments reach ROS init; shutdown cancellation remains in place
+from unittest.mock import patch
+entry_args=['fms_sim.py', '--ros-args', '-p', 'dry_run:=true']
+entry_events=[]
+entry_node=NS(dry_run=True,
+              safe_shutdown=lambda: entry_events.append('cancel'),
+              destroy_node=lambda: entry_events.append('destroy'))
+with patch.object(fms, 'FmsController', return_value=entry_node), \
+     patch.object(fms.rclpy, 'init') as init_call, \
+     patch.object(fms.rclpy, 'spin'), \
+     patch.object(fms.rclpy, 'shutdown'), \
+     patch.object(fms.signal, 'signal'):
+    fms.main(entry_args)
+    ok(init_call.call_args.kwargs['args']==entry_args,
+       'entry point forwards simulation arguments to ROS init')
+    ok(init_call.call_args.kwargs['signal_handler_options']==fms.SignalHandlerOptions.NO
+       and entry_events==['cancel', 'destroy'], 'entry point preserves cancellation on shutdown')
 
 # --- status samples for the GUI check (python3 test_fms.py fms_controller.py out.json)
 if len(sys.argv) > 2:
