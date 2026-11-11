@@ -86,10 +86,10 @@ except ImportError:  # run from another folder: load it next to this file
 # Map poses (x, y, yaw) in the sesac_gangnam_2 map frame. XY were supplied from
 # map-frame PointStamped measurements; yaw values remain the previous defaults.
 POINTS = {
-    'STORE': (0.093633, 0.990360, 1.57),  # 픽업대 (기존 수납대 위치)
+    'STORE': (1.363277, 1.327869, 1.57),  # 픽업대
     'A': (1.376683, 2.648840, 3.14),      # 작업대1
-    'B': (1.363277, 1.327869, 3.14),      # 작업대2 (기존 픽업대 위치)
-    'HOME': (1.060465, 3.829644, 1.57),   # 수납대 기준점 (기존 작업대2 위치)
+    'B': (1.060465, 3.829644, 3.14),      # 작업대2
+    'HOME': (0.093633, 0.990360, 1.57),   # 수납대 기준점
 }
 STATIONS = ('A', 'B')
 MOVING_STATES = ('TO_STORE', 'TO_STATION', 'TO_HOME')
