@@ -37,13 +37,13 @@ from nav2_msgs.action import NavigateToPose
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
-# Fixed map poses (m, m, rad) in the map frame of sesac_gangnam_2 (the driving corridor).
-# Example values placed inside the corridor: replace with the measured ones.
+# Map poses (x, y, yaw) in the sesac_gangnam_2 map frame. XY were supplied from
+# map-frame PointStamped measurements; yaw values remain the previous defaults.
 POINTS = {
-    'STORE': (1.15, 3.55, 1.57),     # 픽업대 (ArUco marker in front)
-    'A': (0.85, 2.40, 3.14),         # 작업대1
-    'B': (0.15, 0.45, 3.14),         # 작업대2
-    'HOME': (0.60, 0.20, 1.57),      # 수납대 (one, shared by both robots)
+    'STORE': (1.363277, 1.327869, 1.57),  # 픽업대
+    'A': (1.376683, 2.648840, 3.14),      # 작업대1
+    'B': (1.060465, 3.829644, 3.14),      # 작업대2
+    'HOME': (0.093633, 0.990360, 1.57),   # 수납대 기준점
 }
 
 MOVING_STATES = ('TO_STORE', 'TO_STATION', 'TO_HOME')

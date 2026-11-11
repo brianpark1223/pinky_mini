@@ -115,7 +115,7 @@ n=mk(dry_run=True, dry_run_travel=0.0)
 ok(not any('register' in k for k in n._srv) and not getattr(n,'_sub',{}),'no registration services/subscriptions')
 ok(set(pd.POINTS)=={'STORE','A','B','HOME'},'fixed points: pickup, 2 workstations, one 수납대')
 n.tick(); st=json.loads(STATUS[-1])
-ok(st['robot']=='pinky_1' and st['home']=='HOME' and 'register' not in st and st['points']['STORE'][0]==pd.POINTS['STORE'][0],
+ok(st['robot']=='pinky_1' and st['home']=='HOME' and 'register' not in st and round(st['points']['STORE'][0], 3)==round(pd.POINTS['STORE'][0], 3),
    'status: robot name, home point, points')
 n.call('delivery/request_a'); n.tick(); n.tick(); n.call('delivery/loaded'); n.tick(); n.call('delivery/received')
 ok(n.state=='TO_HOME' and n.target=='HOME','returns to the 수납대 (HOME)')
