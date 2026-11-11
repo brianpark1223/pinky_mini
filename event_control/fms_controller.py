@@ -62,12 +62,16 @@ from collections import deque
 import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseWithCovarianceStamped
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import ComputePathToPose, NavigateToPose
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
+from sensor_msgs.msg import BatteryState
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+
+from fleet_metrics import battery_fraction, euclidean_distance, path_distance
+from traffic_manager import TrafficManager
 
 try:
     import task_allocation
@@ -89,6 +93,7 @@ POINTS = {
 }
 STATIONS = ('A', 'B')
 MOVING_STATES = ('TO_STORE', 'TO_STATION', 'TO_HOME')
+WAITING_STATES = ('WAIT_PICKUP', 'WAIT_TRAFFIC', 'WAIT_LOAD', 'WAIT_RECEIVE')
 
 
 class Robot:
@@ -103,6 +108,7 @@ class Robot:
         self.move_state = None       # state of the failed step (for retry)
         self.error = None
         self.nav = None              # ActionClient
+        self.planner = None          # ComputePathToPose ActionClient
         self.dock_cli = None         # Trigger client
         self.goal_seq = 0            # bumps on every goal; stale callbacks ignored
         self.goal_handle = None
@@ -118,6 +124,23 @@ class Robot:
         self.distance_remaining = None
         self.pose = None             # (x, y) for allocation cost
         self.pose_seen = None
+        self.battery_percent = None
+        self.battery_seen = None
+        self.path_distance = None
+        self.distance_to_store = None
+        self.path_distance_seen = None
+        self.path_target = None
+        self.path_origin = None
+        self.path_source = None
+        self.path_pending = False
+        self.path_request_started = None
+        self.path_seq = 0
+        self.nav_missing_since = None
+        self.pending_move = None
+        self.traffic_direction = None
+        self.traffic_waypoint_pending = False
+        self.last_location = 'HOME'
+        self.allocation_cost = None
         self.home_slot = None        # index of the HOME parking slot it uses
         self.wait_since = None       # entered WAIT_PICKUP
         self.go_home_when_free = False   # delivered, queue empty -> head home
@@ -136,6 +159,16 @@ class FmsController(Node):
         self.home_min_separation = float(p('home_min_separation', 0.5))
         self.docking = bool(p('docking', False))
         self.pose_timeout = float(p('pose_timeout', 3.0))
+        self.offline_timeout = float(p('offline_timeout', 5.0))
+        self.battery_timeout = float(p('battery_timeout', 10.0))
+        self.low_battery = float(p('low_battery_percent', 0.20))
+        self.critical_battery = float(p('critical_battery_percent', 0.08))
+        self.battery_required = bool(p('battery_required', not self.dry_run))
+        self.path_cost_timeout = float(p('path_cost_timeout', 10.0))
+        self.path_query_wait = float(p('path_query_wait', 0.8))
+        self.cost_distance_weight = float(p('cost_distance_weight', 0.6))
+        self.cost_battery_weight = float(p('cost_battery_weight', 0.2))
+        self.cost_load_weight = float(p('cost_load_weight', 0.2))
         self.cancel_timeout = float(p('cancel_timeout', 5.0))
         self.pickup_clearance = float(p('pickup_clearance', 0.8))
         self.station_clearance = float(p('station_clearance', 0.2 if self.dry_run else 0.6))
@@ -146,7 +179,9 @@ class FmsController(Node):
         self.t_unloading = float(p('t_unloading', 15.0))
         self.detour = float(p('detour_factor', 1.25))
         nav_fmt = p('nav_action', '/{robot}/navigate_to_pose')
+        path_fmt = p('path_action', '/{robot}/compute_path_to_pose')
         pose_fmt = p('pose_topic', '/{robot}/amcl_pose')
+        battery_fmt = p('battery_topic', '/{robot}/battery_state')
         dock_start_fmt = p('dock_start', '/{robot}/delivery/dock_start')
         dock_topic_fmt = p('dock_topic', '/{robot}/delivery/dock')
         names = [r.strip() for r in str(p('robots', 'pinky_1,pinky_2')).split(',') if r.strip()]
@@ -205,16 +240,42 @@ class FmsController(Node):
                     if math.hypot(first[0] - second[0], first[1] - second[1]) \
                             < self.home_min_separation:
                         raise ValueError('home slots are closer than home_min_separation')
+        self.traffic_enabled = bool(p('traffic_enabled', not self.dry_run))
+        traffic_json = str(p('traffic_json', '')).strip()
+        traffic_file = str(p('traffic_file', '')).strip()
+        if traffic_json and traffic_file:
+            raise ValueError('Specify either traffic_json or traffic_file')
+        if self.traffic_enabled and not self.dry_run and not (traffic_json or traffic_file):
+            raise ValueError('Real mode requires a measured traffic_file when traffic_enabled=true')
+        if traffic_file:
+            with open(traffic_file, encoding='utf-8') as stream:
+                traffic_config = json.load(stream)
+        elif traffic_json:
+            traffic_config = json.loads(traffic_json)
+        else:
+            traffic_config = {'enabled': self.traffic_enabled, 'corridor_axis': [[0, 0], [1, 0]]}
+        traffic_config['enabled'] = self.traffic_enabled
+        self.traffic = TrafficManager(traffic_config)
+        if self.traffic_enabled and not self.dry_run \
+                and any(self.traffic.waypoint(direction) is None
+                        for direction in self.traffic.DIRECTIONS):
+            raise ValueError('Real traffic config requires measured entry_waypoint and exit_waypoint')
         if len(names) != len(set(names)) or not names or self.pose_timeout <= 0 \
                 or self.pickup_clearance <= 0 or self.station_clearance <= 0 \
                 or self.cancel_timeout <= 0 or self.nav_timeout <= 0 \
-                or self.home_min_separation <= 0 or self.home not in self.points:
+                or self.home_min_separation <= 0 or self.home not in self.points \
+                or self.offline_timeout <= 0 or self.battery_timeout <= 0 \
+                or not 0 <= self.critical_battery < self.low_battery <= 1 \
+                or self.path_cost_timeout <= 0 or self.path_query_wait < 0 \
+                or min(self.cost_distance_weight, self.cost_battery_weight,
+                       self.cost_load_weight) < 0:
             raise ValueError('Invalid robot names or safety parameters')
 
         self.robots = {}
         for name in names:
             r = Robot(name)
             r.nav = ActionClient(self, NavigateToPose, nav_fmt.format(robot=name))
+            r.planner = ActionClient(self, ComputePathToPose, path_fmt.format(robot=name))
             if self.docking:
                 r.dock_cli = self.create_client(Trigger, dock_start_fmt.format(robot=name))
                 self.create_subscription(String, dock_topic_fmt.format(robot=name),
@@ -222,8 +283,13 @@ class FmsController(Node):
             if pose_fmt:
                 self.create_subscription(PoseWithCovarianceStamped, pose_fmt.format(robot=name),
                                          lambda m, r=r: self.on_pose(r, m), 10)
+            if battery_fmt:
+                self.create_subscription(BatteryState, battery_fmt.format(robot=name),
+                                         lambda m, r=r: self.on_battery(r, m), 10)
             r.pose = self.home_slot_pose(len(self.robots))[:2] if self.dry_run else None
             r.pose_seen = time.monotonic() if self.dry_run else None
+            r.battery_percent = 1.0 if self.dry_run else None
+            r.battery_seen = time.monotonic() if self.dry_run else None
             r.home_slot = len(self.robots)       # everyone starts parked at the 수납대
             self.robots[name] = r
 
@@ -246,7 +312,8 @@ class FmsController(Node):
         self.srvs.append(self.create_service(Trigger, 'delivery/disarm', self.disarm))
         for name, r in self.robots.items():
             for srv, fn in (('loaded', self.loaded), ('received', self.received),
-                            ('retry', self.retry), ('reset', self.reset)):
+                            ('retry', self.retry), ('reset', self.reset),
+                            ('traffic_clear', self.traffic_clear)):
                 self.srvs.append(self.create_service(
                     Trigger, f'delivery/{name}/{srv}', lambda req, res, r=r, fn=fn: fn(r, res)))
 
@@ -267,6 +334,18 @@ class FmsController(Node):
 
     def nav_ready(self, r):
         return self.dry_run or r.nav.server_is_ready()
+
+    def battery_ready(self, r):
+        return r.battery_percent is not None and r.battery_seen is not None and (
+            self.dry_run or time.monotonic() - r.battery_seen <= self.battery_timeout)
+
+    def robot_online(self, r):
+        return self.pose_ready(r) and self.nav_ready(r) \
+            and (self.battery_ready(r) or not self.battery_required)
+
+    def robot_eligible(self, r):
+        return self.robot_online(r) and (
+            not self.battery_required or r.battery_percent >= self.low_battery)
 
     def pose_ready(self, r):
         return r.pose is not None and r.pose_seen is not None and (
@@ -291,7 +370,7 @@ class FmsController(Node):
 
     def arm(self, request, response):
         response.success = not self.shutting_down and all(
-            self.pose_ready(r) and self.nav_ready(r)
+            self.robot_eligible(r)
             and r.state not in MOVING_STATES and r.state != 'STOPPING'
             and not r.goal_pending and r.goal_handle is None and r.stop_reason is None
             for r in self.robots.values()) \
@@ -300,6 +379,8 @@ class FmsController(Node):
                     else all(other.name == owner or self.clear_of_station(other, station)
                              for other in self.robots.values())
                     for station, owner in self.station_owners.items())
+        if self.traffic.stale_occupants():
+            response.success = False
         if response.success:
             self.armed = True
         response.message = 'FMS armed' if response.success else 'Nav2, localization, goals or shared areas not clear'
@@ -331,22 +412,118 @@ class FmsController(Node):
             return
         r.pose = (p.x, p.y)
         r.pose_seen = time.monotonic()
+        self.traffic.update(r.name, r.pose, r.pose_seen)
+
+    def on_battery(self, r, msg):
+        value = battery_fraction(msg)
+        if value is None:
+            self.get_logger().warn(f'[{r.name}] invalid BatteryState.percentage; data ignored')
+            return
+        r.battery_percent = value
+        r.battery_seen = time.monotonic()
+
+    def euclidean_cost(self, r, location='STORE'):
+        return euclidean_distance(r.pose, self.points.get(location))
+
+    def distance_cost(self, r, location='STORE'):
+        now = time.monotonic()
+        if r.path_target == location and r.path_distance is not None \
+                and r.path_distance_seen is not None \
+                and now - r.path_distance_seen <= self.path_cost_timeout \
+                and euclidean_distance(r.pose, r.path_origin) is not None \
+                and euclidean_distance(r.pose, r.path_origin) <= 0.25:
+            return r.path_distance, 'nav2_path'
+        fallback = self.euclidean_cost(r, location)
+        if self.dry_run or not r.planner.server_is_ready():
+            return fallback, 'euclidean'
+        if not r.path_pending:
+            self.request_path_cost(r, location)
+        if self.path_query_wait > 0 and r.path_pending and r.path_request_started is not None \
+                and now - r.path_request_started < self.path_query_wait:
+            return None, 'nav2_pending'
+        return fallback, 'euclidean'
+
+    def request_path_cost(self, r, location):
+        r.path_seq += 1
+        seq = r.path_seq
+        r.path_pending = True
+        r.path_request_started = time.monotonic()
+        r.path_target = location
+        r.path_origin = tuple(r.pose) if r.pose is not None else None
+        goal = ComputePathToPose.Goal()
+        goal.goal.header.frame_id = self.frame
+        goal.goal.header.stamp = self.get_clock().now().to_msg()
+        x, y, yaw = self.points[location]
+        goal.goal.pose.position.x = float(x)
+        goal.goal.pose.position.y = float(y)
+        goal.goal.pose.orientation.z = math.sin(yaw / 2)
+        goal.goal.pose.orientation.w = math.cos(yaw / 2)
+        try:
+            r.planner.send_goal_async(goal).add_done_callback(
+                lambda fut, r=r, seq=seq: self.path_goal_response(r, fut, seq))
+        except Exception as exc:  # noqa: BLE001
+            r.path_pending = False
+            self.get_logger().warn(f'[{r.name}] path query failed; Euclidean fallback: {exc}')
+
+    def path_goal_response(self, r, future, seq):
+        if seq != r.path_seq:
+            return
+        try:
+            handle = future.result()
+        except Exception as exc:  # noqa: BLE001
+            r.path_pending = False
+            self.get_logger().warn(f'[{r.name}] path goal unavailable; Euclidean fallback: {exc}')
+            return
+        if not handle.accepted:
+            r.path_pending = False
+            return
+        handle.get_result_async().add_done_callback(
+            lambda fut, r=r, seq=seq: self.path_result(r, fut, seq))
+
+    def path_result(self, r, future, seq):
+        if seq != r.path_seq:
+            return
+        r.path_pending = False
+        try:
+            wrapped = future.result()
+            result = getattr(wrapped, 'result', wrapped)
+            distance = path_distance(result.path)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'[{r.name}] invalid Nav2 path; Euclidean fallback: {exc}')
+            return
+        if distance is not None:
+            r.path_distance = distance
+            r.path_distance_seen = time.monotonic()
+            r.path_source = 'nav2_path'
 
     # ---------------------------------------------------- allocation inputs
     def alloc_ctx(self):
         return {'speed': self.avg_speed, 't_loading': self.t_loading, 't_unloading': self.t_unloading,
-                'detour': self.detour, 'pickup': self.pickup, 'home': self.home, 'docking': self.docking}
+                'detour': self.detour, 'pickup': self.pickup, 'home': self.home,
+                'docking': self.docking, 'w_dist': self.cost_distance_weight,
+                'w_wait': self.cost_load_weight, 'w_battery': self.cost_battery_weight}
 
     def can_take_task(self, r):
-        return (r.state == 'IDLE' and r.current is None and self.nav_ready(r)
-                and self.pose_ready(r) and not r.goal_pending and r.goal_handle is None
+        return (r.state == 'IDLE' and r.current is None and self.robot_eligible(r)
+                and not r.goal_pending and r.goal_handle is None
                 and r.stop_reason is None)
 
     def robot_info(self, r, now):
         """What the allocator sees for one robot (every robot, busy ones too)."""
-        return {'state': r.state, 'pose': r.pose, 'battery': None, 'current': r.current,
-                'target': r.target, 'free': self.can_take_task(r),
-                'elapsed': round(now - r.state_since, 2)}
+        free = self.can_take_task(r)
+        distance, source = (None, None)
+        if free:
+            distance, source = self.distance_cost(r, 'STORE')
+            free = distance is not None
+        if distance is not None:
+            r.distance_to_store, r.path_source = distance, source
+        battery = r.battery_percent * 100.0 if self.battery_ready(r) else None
+        return {'state': r.state, 'pose': r.pose, 'battery': battery,
+                'battery_percent': r.battery_percent if self.battery_ready(r) else None,
+                'battery_ready': self.battery_ready(r), 'current': r.current,
+                'target': r.target, 'free': free, 'eligible': self.robot_eligible(r),
+                'route_m': distance, 'distance_to_store': distance,
+                'distance_source': source, 'elapsed': round(now - r.state_since, 2)}
 
     def assignable(self):
         """Queued requests whose station is not locked and is clear of robots."""
@@ -378,9 +555,18 @@ class FmsController(Node):
                 'state': r.state,
                 'current': r.current,
                 'target': None if r.state in ('IDLE', 'WAIT_PICKUP') else r.target,
+                'move_state': r.move_state,
                 'error': r.error,
                 'nav_ready': self.nav_ready(r),
                 'pose_ready': self.pose_ready(r),
+                'online': self.robot_online(r),
+                'battery_ready': self.battery_ready(r),
+                'battery_percent': None if r.battery_percent is None else round(r.battery_percent, 3),
+                'low_battery': self.battery_ready(r) and r.battery_percent < self.low_battery,
+                'distance_to_store': r.distance_to_store,
+                'distance_source': r.path_source,
+                'allocation_cost': r.allocation_cost,
+                'traffic_direction': r.traffic_direction,
                 'goal_pending': r.goal_pending,
                 'timeout_left': None if self.dry_run else left,
                 'distance_remaining': r.distance_remaining if r.state in MOVING_STATES else None,
@@ -392,6 +578,7 @@ class FmsController(Node):
             'pickup': self.pickup,
             'pickup_clear': self.pickup is None and self.pickup_area_clear(None),
             'stations': self.station_owners,
+            'traffic': self.traffic.status(),
             'armed': self.armed,
             'dry_run': self.dry_run,
             'points': {k: [round(c, 3) for c in v] for k, v in self.points.items()},
@@ -402,6 +589,25 @@ class FmsController(Node):
     def tick(self):
         now = time.monotonic()
         for r in self.robots.values():
+            self.traffic.update(r.name, r.pose, r.pose_seen)
+            if r.path_pending and r.path_request_started is not None \
+                    and now - r.path_request_started > self.path_cost_timeout:
+                r.path_pending = False
+            if r.state in MOVING_STATES and not self.nav_ready(r):
+                r.nav_missing_since = r.nav_missing_since or now
+                if now - r.nav_missing_since > self.offline_timeout:
+                    self.stop_goal(r, 'Nav2 server offline during navigation',
+                                   lambda r=r: self.fail(r, 'Nav2 server offline during navigation'))
+            else:
+                r.nav_missing_since = None
+            if r.state in MOVING_STATES and self.battery_ready(r) \
+                    and r.battery_percent < self.critical_battery:
+                self.stop_goal(r, 'Critical battery during navigation',
+                               lambda r=r: self.fail(r, 'Critical battery; operator recovery required'))
+            if r.state in MOVING_STATES and self.battery_required and not self.battery_ready(r):
+                self.stop_goal(r, 'Battery telemetry stale during navigation',
+                               lambda r=r: self.fail(
+                                   r, 'Battery telemetry stale; operator recovery required'))
             if r.stop_reason is not None and r.stop_started is not None \
                     and now - r.stop_started > self.cancel_timeout and r.state == 'STOPPING':
                 r.state = 'ERROR'
@@ -437,10 +643,27 @@ class FmsController(Node):
             self.publish_status()
             return
 
-        # 1) hand new requests to free robots (task_allocation -> Allocator.dispatch decides who)
+        # A robot waiting at a safe endpoint retries its corridor reservation.
+        for r in self.robots.values():
+            if r.state != 'WAIT_TRAFFIC' or r.pending_move is None:
+                continue
+            if self.traffic.waiting_timed_out(r.name):
+                self.traffic.cancel_wait(r.name)
+                self.fail(r, 'Traffic wait timeout; inspect corridor and reservations')
+                continue
+            location, state, pose = r.pending_move
+            self.schedule_move(r, location, state, pose)
+
+        # 1) hand new requests to free robots. The existing allocator keeps its
+        # wait-time/continuous-task model; route_m and battery now come from live
+        # Nav2/BatteryState data instead of placeholders.
         infos = {n: self.robot_info(r, now) for n, r in self.robots.items()}
         free = {n for n, i in infos.items() if i['free']}
         available = self.assignable()
+        costs = task_allocation.allocation_costs(infos, self.points, self.alloc_ctx())
+        for name, value in costs.items():
+            if name in self.robots:
+                self.robots[name].allocation_cost = value
         if available and free:
             for name, task in task_allocation.assign(infos, available, self.points, self.alloc_ctx()):
                 if name not in free or task not in self.queue \
@@ -457,7 +680,7 @@ class FmsController(Node):
         if self.pickup is None:
             waiting = {n: {'pose': r.pose, 'since': r.wait_since, 'task': r.current}
                        for n, r in self.robots.items() if r.state == 'WAIT_PICKUP'
-                       and self.pose_ready(r) and self.nav_ready(r)}
+                       and self.robot_eligible(r)}
             name = task_allocation.pickup_order(waiting, self.points)
             if name is not None:
                 self.go_pickup(self.robots[name])
@@ -468,7 +691,7 @@ class FmsController(Node):
             assignable = any(self.station_owners[task['station']] is None
                              and self.station_area_clear(task['station']) for task in self.queue)
             if r.state == 'IDLE' and r.go_home_when_free and not assignable \
-                    and self.pose_ready(r) and self.nav_ready(r):
+                    and self.robot_eligible(r):
                 r.go_home_when_free = False
                 self.go_home(r)
 
@@ -491,7 +714,7 @@ class FmsController(Node):
                 and self.pickup_area_clear(r) and self.nav_ready(r):
             self.pickup = r.name
             r.wait_since = None
-            self.move(r, 'STORE', 'TO_STORE')
+            self.schedule_move(r, 'STORE', 'TO_STORE')
         else:
             r.target = None
             r.distance_remaining = None
@@ -508,7 +731,28 @@ class FmsController(Node):
         used = {o.home_slot for o in self.robots.values() if o is not r and o.home_slot is not None}
         slot = next(i for i in range(len(self.robots) + 1) if i not in used)
         r.home_slot = slot
-        self.move(r, self.home, 'TO_HOME', pose=self.home_slot_pose(slot))
+        self.schedule_move(r, self.home, 'TO_HOME', pose=self.home_slot_pose(slot))
+
+    def schedule_move(self, r, location, state, pose=None):
+        direction = 'entry' if state == 'TO_STORE' else 'exit'
+        allowed, reason = self.traffic.request(r.name, direction, r.pose, r.pose_seen)
+        if allowed:
+            r.pending_move = None
+            r.traffic_direction = direction if self.traffic.enabled else None
+            # Enter/leave the shared gate through a measured waypoint. Other
+            # trips keep the conservative reservation without a needless detour.
+            waypoint = self.traffic.waypoint(direction) if (
+                state == 'TO_STORE' or r.last_location == 'STORE') else None
+            r.traffic_waypoint_pending = waypoint is not None
+            self.move(r, location, state, waypoint if waypoint is not None else pose)
+            return True
+        r.pending_move = (location, state, pose)
+        r.target = location
+        r.move_state = state
+        r.wait_since = r.wait_since or time.monotonic()
+        r.error = f'Traffic waiting: {reason}'
+        self.set_state(r, 'WAIT_TRAFFIC')
+        return False
 
     # -------------------------------------------------------------- navigation
     def move(self, r, location, state, pose=None):
@@ -649,6 +893,14 @@ class FmsController(Node):
         if self.dry_run and r.goal_pose is not None:
             r.pose = (r.goal_pose[0], r.goal_pose[1])      # real runs: pose from amcl_pose
             r.pose_seen = time.monotonic()
+        if r.traffic_waypoint_pending:
+            # Keep the reservation between the gate waypoint and destination.
+            r.traffic_waypoint_pending = False
+            self.move(r, r.target, r.move_state)
+            return
+        r.last_location = r.target
+        self.traffic.release(r.name)
+        r.traffic_direction = None
         if r.state == 'TO_STORE':
             if self.docking:
                 self.start_docking(r)
@@ -703,12 +955,12 @@ class FmsController(Node):
 
     def loaded(self, r, response):
         response.success = self.armed and r.state == 'WAIT_LOAD' \
-            and self.pose_ready(r) and self.nav_ready(r)
+            and self.robot_eligible(r)
         response.message = f'{r.name}: loading confirmed' if response.success \
             else f'{r.name}: FMS disarmed, Nav2/localization unavailable, or not waiting for loading (state={r.state})'
         if response.success:
             r.departure_started_at = time.monotonic()
-            self.move(r, r.current['station'], 'TO_STATION')
+            self.schedule_move(r, r.current['station'], 'TO_STATION')
         return response
 
     def received(self, r, response):
@@ -749,9 +1001,9 @@ class FmsController(Node):
             response.success = False
             response.message = f'{r.name}: previous Nav2 goal has not stopped'
             return response
-        if not self.nav_ready(r) or not self.pose_ready(r):
+        if not self.robot_eligible(r):
             response.success = False
-            response.message = f'{r.name}: Nav2 or localization not ready'
+            response.message = f'{r.name}: Nav2, localization, or battery not ready'
             return response
         response.success = True
         response.message = f'{r.name}: retrying {r.move_state} -> {r.target}'
@@ -767,7 +1019,7 @@ class FmsController(Node):
         elif step == 'TO_HOME':
             self.go_home(r)
         else:
-            self.move(r, r.target, step)
+            self.schedule_move(r, r.target, step)
         return response
 
     def reset(self, r, response):
@@ -796,8 +1048,31 @@ class FmsController(Node):
         r.dock_deadline = None
         r.wait_since = None
         r.go_home_when_free = False      # do not initiate another trip after a reset
-        self.set_state(r, 'IDLE')
+        r.pending_move = None
+        r.traffic_waypoint_pending = False
+        self.traffic.cancel_wait(r.name)
+        if r.name in self.traffic.occupants:
+            r.error = 'Traffic lock retained after cancellation; disarm and clear after physical inspection'
+            self.set_state(r, 'ERROR')
+        else:
+            self.set_state(r, 'IDLE')
         self.get_logger().warn(f'[{r.name}] reset completed. Dropped task: {dropped}')
+
+    def traffic_clear(self, r, response):
+        safe = not self.armed and r.goal_handle is None and not r.goal_pending \
+            and r.state not in MOVING_STATES and r.state != 'STOPPING'
+        response.success = safe
+        if safe:
+            self.traffic.release(r.name)
+            r.traffic_direction = None
+            if r.error and 'Traffic lock retained' in r.error:
+                r.error = None
+                r.stop_reason = None
+                self.set_state(r, 'IDLE')
+            response.message = f'{r.name}: traffic reservation cleared after operator confirmation'
+        else:
+            response.message = f'{r.name}: disarm and confirm Nav2 stopped before clearing traffic'
+        return response
 
     def fail(self, r, message):
         r.nav_deadline = None

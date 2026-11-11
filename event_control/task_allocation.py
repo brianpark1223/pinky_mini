@@ -155,7 +155,8 @@ def _get_alloc(points, ctx):
     zones = {k: (float(v[0]), float(v[1])) for k, v in points.items()}
     detour = float(ctx.get('detour', 1.0) or 1.0)
     key = (tuple(sorted(zones.items())), detour, ctx.get('speed'), ctx.get('t_loading'),
-           ctx.get('t_unloading'), ctx.get('docking'))
+           ctx.get('t_unloading'), ctx.get('docking'), ctx.get('w_dist'),
+           ctx.get('w_wait'), ctx.get('w_battery'))
     if _cls_alloc is not None and key == _cls_key:
         return _cls_alloc
     over = {}
@@ -167,6 +168,9 @@ def _get_alloc(points, ctx):
         over['t_receive_s'] = float(ctx['t_unloading'])
     if ctx.get('docking') is False:
         over['t_align_s'] = 0.0
+    for key in ('w_dist', 'w_wait', 'w_battery'):
+        if ctx.get(key) is not None:
+            over[key] = float(ctx[key])
     cfg = _ext.Config()
     if over:
         from dataclasses import replace
@@ -209,7 +213,7 @@ def _to_robot(name, info, points):
         st = S('ERROR')                      # busy without a task: cannot estimate
     return _ext.Robot(name=name, state=st, pos=(float(pos[0]), float(pos[1])), task=task,
                       state_elapsed_s=float(info.get('elapsed') or 0.0),
-                      battery=info.get('battery'))
+                      battery=info.get('battery'), route_m=info.get('route_m'))
 
 
 def _class_assign(robots, queue, points, ctx):
@@ -247,6 +251,19 @@ def assign(robots, queue, points, ctx=None):
         except Exception as exc:  # noqa: BLE001
             print(f'[task_allocation] allocator.assign() failed ({exc}); using default rules', file=sys.stderr)
     return default_assign(robots, queue, points, ctx)
+
+
+def allocation_costs(robots, points, ctx=None):
+    """Return the actual comparable costs used by the active allocator."""
+    if _has_class():
+        try:
+            alloc = _get_alloc(points, ctx or {})
+            snap = [_to_robot(n, i, points) for n, i in robots.items()]
+            return {estimate.robot: estimate.C for estimate in alloc.estimates(snap)}
+        except Exception as exc:  # noqa: BLE001
+            print(f'[task_allocation] cost reporting failed ({exc})', file=sys.stderr)
+    return {name: _cost(info, points.get('STORE')) for name, info in robots.items()
+            if info.get('free', True)}
 
 
 def pickup_order(waiting, points):

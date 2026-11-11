@@ -34,13 +34,13 @@ ROS2 Jazzy / Python3. 의존 패키지: rclpy, nav2_msgs, action_msgs, std_msgs,
 
 ## 팀 인터페이스 (이것만 지키면 각자 수정해도 연동됨)
 
-- 서비스 (`std_srvs/srv/Trigger`): `delivery/request_a`, `delivery/request_b`, `delivery/loaded`,
-  `delivery/received`, `delivery/retry`, `delivery/reset`
+- 서비스 (`std_srvs/srv/Trigger`): `delivery/request_a`, `delivery/request_b`, `delivery/arm`,
+  `delivery/disarm`, 로봇별 `loaded`, `received`, `retry`, `reset`, `traffic_clear`
 - 상태 토픽 `delivery/status` (`std_msgs/String`, JSON, 0.2초 주기)
 
 | 필드 | 사용하는 쪽 | 설명 |
 |---|---|---|
-| `state` | GUI, notifier | **필수.** IDLE / TO_STORE / WAIT_LOAD / TO_STATION / WAIT_RECEIVE / TO_HOME / ERROR |
+| `state` | GUI, notifier | **필수.** IDLE / WAIT_TRAFFIC / TO_STORE / WAIT_LOAD / TO_STATION / WAIT_RECEIVE / TO_HOME / ERROR |
 | `current`, `queue` | GUI | 작업 `{id, station, ...}`. 추가 키(count 등)는 GUI에 그대로 표시됨 |
 | `batch` | GUI | (선택) 한 번에 싣고 가는 작업 목록. task 로직에서 묶음 배송을 넣으면 채워주세요 |
 | `target`, `error`, `nav_ready`, `dry_run`, `timeout_left` | GUI | 표시용 |
@@ -78,7 +78,8 @@ GUI는 `robots` 필드가 있으면 2대 화면, 없으면 위의 1대 형식으
 | 픽업대 | 한 번에 한 대(`pickup` = 점유한 로봇). 출발할 때 점유를 잡고 적재 후 지도 위치가 픽업대 반경 밖으로 벗어난 것이 확인될 때 풂. 기다리는 Pinky는 차례대로 진입 |
 | 수납대 | 1곳을 자리 2개로 나눠 씀: 첫 번째 = `HOME`, 두 번째 = `HOME`에서 왼쪽으로 `home_slot_offset`(0.35 m). 0이면 둘 다 `HOME` |
 | 오류 | 그 로봇만 `ERROR`. Nav2 실패·취소는 최종 결과를 확인하고, 픽업대·작업대 잠금은 새로운 지도 위치로 이탈이 확인될 때 풂. 결과가 불명확하면 잠금을 유지하고 현장 확인 필요 |
-| 로봇별 토픽 | `/<robot>/amcl_pose`, `/<robot>/plan`, `/<robot>/delivery/dock`, `/<robot>/camera/image_raw/compressed` (Nav2를 로봇별 namespace로 띄우면 이 이름이 됨). TF는 `<robot>/base_footprint`(frame_prefix)가 있으면 사용 |
+| 로봇별 토픽 | `/<robot>/amcl_pose`, `/<robot>/battery_state`, `/<robot>/plan`, `/<robot>/delivery/dock`, `/<robot>/camera/image_raw/compressed`. TF는 `<robot>/base_footprint` 사용 |
+| 로봇별 Action | `/<robot>/compute_path_to_pose`로 실제 경로 거리를 구하고 `/<robot>/navigate_to_pose`로 이동 |
 
 GUI는 대기열 작업마다 어느 Pinky가 맡을지, 픽업대가 겹칠 때 기다리는 시간까지 넣어 도착 시간을 예상합니다.
 
@@ -258,7 +259,8 @@ ros2 service call /delivery/pinky_1/received std_srvs/srv/Trigger '{}'
 ```bash
 python3 fms_controller.py --ros-args \
     -p points_file:=/absolute/path/to/measured_points.json \
-    -p home_slots_file:=/absolute/path/to/measured_home_slots.json -p docking:=false
+    -p home_slots_file:=/absolute/path/to/measured_home_slots.json \
+    -p traffic_file:=/absolute/path/to/measured_traffic.json -p docking:=false
 # 로봇 이름 / Nav2 action 이름 / 위치 토픽이 다를 때
 python3 fms_controller.py --ros-args -p robots:=pinky_a,pinky_b \
     -p points_file:=/absolute/path/to/measured_points.json \
@@ -274,6 +276,25 @@ python3 parts_delivery.py --ros-args -p dry_run:=false
 ros2 topic echo /delivery/status std_msgs/msg/String --once
 ros2 service call /delivery/arm std_srvs/srv/Trigger '{}'
 ros2 service call /delivery/disarm std_srvs/srv/Trigger '{}'  # 새 배정 중지 및 진행 중 Nav2 goal 취소 요청
+```
+
+`traffic.template.json`을 복사하여 공용 통로 축과 진입/진출 경유점의 실제 map 좌표를 입력합니다.
+실차에서는 두 경유점이 반드시 필요합니다. 진입은 기본 45°(허용 0–90°), 진출은 기본
+135°(허용 90–180°) 방향으로 먼저 경유한 뒤 최종 목적지로 갑니다. 반대 방향은 동시에
+진입할 수 없고, 같은 방향 추종은 기본적으로 꺼져 있습니다. 사용하려면 현장에서 검증한
+`min_follow_distance`와 함께 명시적으로 켜야 합니다.
+
+배정 거리는 `/<robot>/compute_path_to_pose`가 반환한 Path 길이를 우선 사용하고, Planner를
+쓸 수 없을 때만 상태에 `distance_source=euclidean`을 표시하여 AMCL 직선거리를 사용합니다.
+배터리는 `/<robot>/battery_state`의 유효하고 최신인 `percentage`만 사용합니다. 실차 기본값은
+배터리 필수이며, 20% 미만 로봇은 새 작업을 받지 않고 주행 중 8% 미만이면 취소를 요청합니다.
+
+전체 노트북 모듈은 저장소 루트에서 한 번에 시작할 수 있습니다.
+
+```bash
+ROS_DOMAIN_ID=42 ./scripts/start_main_server.sh                         # dry-run
+ROS_DOMAIN_ID=42 ./scripts/start_main_server.sh --real \
+  --points /abs/points.json --home-slots /abs/home.json --traffic /abs/traffic.json
 ```
 
 한 작업대에는 한 차만 배정하고, 픽업대도 한 차만 사용합니다. 수령 완료 직후 작업대 잠금은 유지되며 로봇이 지도 위치상 그 반경을 벗어난 뒤 해제됩니다. Nav2 result가 확인되지 않으면 해당 로봇은 `ERROR`로 남고 재시도·초기화가 막힙니다. 현장에서 로봇 정지와 Nav2 goal 상태를 확인하고 컨트롤러를 재시작해야 합니다. `/delivery/disarm`은 물리적 비상 정지 명령이 아닙니다.
@@ -300,7 +321,7 @@ ros2 service call /delivery/reset std_srvs/srv/Trigger '{}'
 - 적재/하역은 사람이 하고 서비스 호출로 확인합니다.
 - 자동 충전, 개별 작업 취소, 영구 작업 이력, 재시작 후 복구는 미구현입니다.
 - 프로세스 종료 시 알려진 Nav2 goal 취소를 요청하지만 완료를 보장하지 않습니다. 실물 정지는 로봇 자체 정지 절차를 사용하세요.
-- 공용 통로 전체의 교통 잠금, 두 로봇 간 직접 충돌 회피, 정적·동적 costmap의 목표 유효성 검사는 이 컨트롤러에 없습니다. Nav2 자체의 경로 계획·회피를 현장에서 별도 확인해야 합니다. 이 코드는 두 차가 같은 구역에 있을 때의 안전을 보증하지 않습니다.
+- 공용 통로 잠금, 반대 방향 상호 배제, 같은 방향 간격 규칙과 작업대 잠금은 구현했지만 실측 경유점과 두 로봇 현장 검증이 필요합니다. 정적·동적 costmap, Nav2 회피, 하드웨어 비상 정지를 대신하지 않습니다.
 - 이 노드 실행 중 RViz 등에서 별도 Nav2 목적지를 보내지 마세요.
 
 ## 검증 범위
@@ -315,4 +336,7 @@ ROS 없이 가짜 rclpy로 검증했습니다 (`python3 test_fms.py fms_controll
 - `test_notifier.py` 21개: 2대일 때 자기 로봇 상태만 따라감, 전방 섹터 판정(측면/몸체/inf 무시, 각도 보정), 주행 중에만 삐빅, 목적지 근처 음소거, 쿨다운, 대기 상태 노래·반복·중지
 - `test_gui.py` 129개 + 컨트롤러 상태 연동 7개 (PyQt5, PyQt6 각각 통과) (`QT_QPA_PLATFORM=offscreen`): 상태별 버튼 활성화, 서비스 호출, 중복 요청, 요청 버튼 2초 잠금, 대기 안내 문구, 지도 변환·지도 파일(yaml+pgm) 읽기·표시용 지도 정리·회전·평면도 파일·탭별 지도, TF/AMCL 위치 전환·오도메트리로 사이 메우기·표시 떨림 보정, 새 요청 팝업·담당 Pinky 표시, 도착 시간 계산·멈춤·속도 학습, ArUco 도킹 시간(카메라 피드백·마커 놓침·피드백 끊김·도킹 속도 학습), 위치·카메라 표시, 작업대 칸의 수령 완료, Pinky 2대(로봇별 토픽·상태·도착 시간·배정 예상·픽업대 대기·로봇별 서비스·로봇 선택), 1대 컨트롤러로 되돌아가기, `fms_controller.py`가 실제로 보낸 상태로 화면·서비스 이름 확인 (`python3 test_fms.py fms_controller.py s.json` 후 `python3 test_gui.py delivery_gui.py /tmp s.json`)
 
-실제 ROS2/Nav2, Pinky 실물, 스피커 출력, 실제 카메라 토픽은 미검증입니다.
+추가로 `test_fleet_logic.py`가 Nav2 Path 거리, BatteryState 유효성, 반대 방향 잠금,
+같은 방향 간격, stale heartbeat fail-closed, 진입/진출 각도와 경유점을 검증합니다.
+격리된 실제 ROS2 Jazzy 도메인에서는 map lifecycle, FMS dry-run, 상태 발행과 일괄 종료를
+검증했습니다. Pinky 실물, 실제 Nav2/배터리 토픽, 스피커와 카메라는 미검증입니다.

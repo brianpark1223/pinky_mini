@@ -13,7 +13,7 @@ Pinky 부품 배송 FMS - Cost 기반 작업 배정 (순수 파이썬, ROS 의�
 
     D_i : 신규 요청의 픽업대(STORE)까지 총 주행 거리 [m]
     W_i : 정지·대기 시간 [s] (ArUco 정렬 + 픽업대 대기 + 현재 작업의 남은 사람 대기 추정)
-    B_i : 배터리 (README상 배터리 관리가 없으므로 기본 가중치 0)
+    B_i : FMS가 BatteryState에서 읽은 최신 배터리(0~100). 없거나 오래되면 후보 제외
 
 FMS 컨트롤러가 쓰는 방법
     alloc = Allocator(ZONES, Config())
@@ -68,13 +68,14 @@ class Robot:
     task: Optional[Request] = None       # 현재 맡은 작업 (IDLE/TO_HOME/ERROR는 None)
     state_elapsed_s: float = 0.0         # 현재 상태에 들어온 뒤 경과 시간
     battery: Optional[float] = None      # 0 ~ 100, 없으면 None
+    route_m: Optional[float] = None      # 최신 Nav2 경로의 현재 위치 -> STORE 거리
 
 
 @dataclass
 class Config:
     w_dist: float = 0.6
-    w_wait: float = 0.4
-    w_battery: float = 0.0               # 배터리 관리가 없으므로 기본 0 (켜려면 > 0)
+    w_wait: float = 0.2
+    w_battery: float = 0.2
     d_max: Optional[float] = None        # None이면 지점 좌표로 자동 추정
     w_max_s: Optional[float] = None      # None이면 시간 설정으로 자동 추정
     v: float = 0.2                       # 평균 주행 속도 [m/s] (실측 필요)
@@ -177,7 +178,9 @@ class Allocator:
             return None
         rem_d, rem_w, free_pos = rem
         c = self.cfg
-        D = rem_d + self.dist(free_pos, self.zones["STORE"])
+        to_store = r.route_m if r.state in AVAILABLE and isinstance(r.route_m, (int, float)) \
+            and math.isfinite(r.route_m) and r.route_m >= 0 else self.dist(free_pos, self.zones["STORE"])
+        D = rem_d + to_store
         t_arrive = D / c.v + rem_w
         pickup_wait = max(0.0, self._store_free_in(r, robots) - t_arrive)
         W = rem_w + pickup_wait + c.t_align_s

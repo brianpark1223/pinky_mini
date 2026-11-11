@@ -55,6 +55,8 @@ class G:
         P=lambda: types.SimpleNamespace(x=0,y=0,z=0,w=0)
         s.pose=types.SimpleNamespace(header=types.SimpleNamespace(frame_id=None,stamp=None),
                                      pose=types.SimpleNamespace(position=P(),orientation=P()))
+class CG:
+    def __init__(s): s.goal=G().pose
 
 def mod(n,**kw):
     m=types.ModuleType(n); m.__dict__.update(kw); sys.modules[n]=m
@@ -72,7 +74,8 @@ class FakeBuffer:
                rotation=types.SimpleNamespace(x=0.0,y=0.0,z=_m.sin(yaw/2),w=_m.cos(yaw/2))))
 mod('tf2_ros', Buffer=FakeBuffer, TransformListener=lambda *a,**k: None)
 mod('rclpy.time', Time=lambda: None)
-mod('nav2_msgs'); mod('nav2_msgs.action', NavigateToPose=types.SimpleNamespace(Goal=G))
+mod('nav2_msgs'); mod('nav2_msgs.action', NavigateToPose=types.SimpleNamespace(Goal=G),
+                      ComputePathToPose=types.SimpleNamespace(Goal=CG))
 mod('std_msgs'); mod('std_msgs.msg', String=lambda data: types.SimpleNamespace(data=data))
 mod('std_srvs'); mod('std_srvs.srv', Trigger=object)
 
@@ -90,6 +93,10 @@ def bridge(path):
     sp=importlib.util.spec_from_file_location('task_allocation_t', os.path.join(HERE,'task_allocation.py'))
     m=importlib.util.module_from_spec(sp); sp.loader.exec_module(m); fms.task_allocation=m; return m
 def mk(**p):
+    if p.get('dry_run') is False:
+        p.setdefault('traffic_enabled', False)
+        p.setdefault('battery_required', False)
+        p.setdefault('path_query_wait', 0.0)
     PARAMS.clear(); PARAMS.update(p); ACTIONS.clear(); CLIENTS.clear(); return fms.FmsController()
 def ok(c,msg):
     assert c, msg; print('PASS', msg)
@@ -145,7 +152,7 @@ for name,(x,y) in (('pinky_1',(1.3,0.2)),('pinky_2',(1.9,0.2))):  # HOME slot 0 
 n.call('delivery/request_a'); n.tick()
 ok(not any(a.sent for a in ACTIONS.values()) and len(n.queue)==1,'real mode: not armed -> no goal')
 res=n.call('delivery/arm'); n.tick()
-sent=[k for k,a in ACTIONS.items() if a.sent]
+sent=[k for k,a in ACTIONS.items() if a.sent and k.endswith('/navigate_to_pose')]
 ok(res.success and len(sent)==1 and not n.queue,'armed -> Allocator assigns, one Nav2 goal sent')
 
 # --- STOPPING / ERROR robots are never chosen

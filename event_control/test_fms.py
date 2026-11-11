@@ -1,5 +1,6 @@
 import sys, types, time, importlib.util
 import tempfile
+import os
 
 # ---- fake ROS modules ----
 class Fut:
@@ -59,6 +60,10 @@ class G:
         s.pose=types.SimpleNamespace(header=types.SimpleNamespace(frame_id=None,stamp=None),
                                      pose=types.SimpleNamespace(position=P(),orientation=P()))
 
+class PG:
+    def __init__(s):
+        s.goal=G().pose
+
 def mod(n,**kw):
     m=types.ModuleType(n); m.__dict__.update(kw); sys.modules[n]=m
 mod('rclpy', init=lambda:None, spin=lambda n:None, ok=lambda:True, shutdown=lambda:None)
@@ -75,7 +80,9 @@ class FakeBuffer:
                rotation=types.SimpleNamespace(x=0.0,y=0.0,z=_m.sin(yaw/2),w=_m.cos(yaw/2))))
 mod('tf2_ros', Buffer=FakeBuffer, TransformListener=lambda *a,**k: None)
 mod('rclpy.time', Time=lambda: None)
-mod('nav2_msgs'); mod('nav2_msgs.action', NavigateToPose=types.SimpleNamespace(Goal=G))
+mod('nav2_msgs'); mod('nav2_msgs.action', NavigateToPose=types.SimpleNamespace(Goal=G),
+    ComputePathToPose=types.SimpleNamespace(Goal=PG))
+mod('sensor_msgs'); mod('sensor_msgs.msg', BatteryState=object)
 mod('std_msgs'); mod('std_msgs.msg', String=lambda data: types.SimpleNamespace(data=data))
 mod('std_srvs'); mod('std_srvs.srv', Trigger=object)
 
@@ -83,6 +90,7 @@ mod('std_srvs'); mod('std_srvs.srv', Trigger=object)
 mod('std_srvs.srv', Trigger=types.SimpleNamespace(Request=lambda: None))
 import json
 PARAMS={}; STATUS=[]; LOG=[]
+sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[1])))
 spec=importlib.util.spec_from_file_location('fms', sys.argv[1]); fms=importlib.util.module_from_spec(spec); spec.loader.exec_module(fms)
 NS=types.SimpleNamespace
 
@@ -91,6 +99,9 @@ def mk(**p):
         p.setdefault('points_json', json.dumps(fms.POINTS))
         p.setdefault('home_slots_json', json.dumps([[0.6,0.2,1.57],[1.4,0.2,1.57]]))
         p.setdefault('station_clearance', 0.2)  # sample HOME and B are close; tests use virtual poses
+        p.setdefault('traffic_enabled', False)
+        p.setdefault('battery_required', False)
+        p.setdefault('path_query_wait', 0.0)
     PARAMS.clear(); PARAMS.update(p); ACTIONS.clear(); CLIENTS.clear()
     n=fms.FmsController()
     if not n.dry_run:
@@ -112,7 +123,9 @@ try:
 except ValueError:
     print('PASS default real mode refuses missing measured coordinates')
 PARAMS.update(points_json=json.dumps(fms.POINTS),
-              home_slots_json=json.dumps([[0.6,0.2,1.57],[1.4,0.2,1.57]]))
+              home_slots_json=json.dumps([[0.6,0.2,1.57],[1.4,0.2,1.57]]),
+              traffic_json=json.dumps({'corridor_axis':[[0,0],[10,0]],
+                                       'entry_waypoint':[1,2], 'exit_waypoint':[3,4]}))
 ACTIONS.clear()
 n=fms.FmsController()
 ok(n.dry_run is False and n.armed is False, 'default controller is real mode and disarmed')
@@ -125,8 +138,11 @@ ok(list(n.robots)==['pinky_1','pinky_2'],'two robots by default')
 for name in ('delivery/request_a','delivery/request_b','delivery/pinky_1/loaded','delivery/pinky_2/received',
              'delivery/pinky_1/retry','delivery/pinky_2/reset'):
     ok(name in n._srv, f'service {name}')
-ok(set(ACTIONS)=={'/pinky_1/navigate_to_pose','/pinky_2/navigate_to_pose'},'one Nav2 action client per robot')
+ok(set(ACTIONS)=={'/pinky_1/navigate_to_pose','/pinky_2/navigate_to_pose',
+                  '/pinky_1/compute_path_to_pose','/pinky_2/compute_path_to_pose'},
+   'one Nav2 navigation and path action client per robot')
 ok('/pinky_2/amcl_pose' in n._sub,'pose subscription per robot (allocation cost)')
+ok('/pinky_2/battery_state' in n._sub,'battery subscription per robot')
 s0=st(n)
 ok(set(s0['robots'])=={'pinky_1','pinky_2'} and s0['queue']==[] and s0['pickup'] is None and s0['points']['STORE'][0]==fms.POINTS['STORE'][0],
    'status: robots dict, queue, pickup holder, points')
@@ -250,7 +266,8 @@ ok(not n.call('delivery/arm').success, 'arm rejects stale localization')
 n.robots['pinky_2'].pose_seen=time.monotonic()
 ok(n.call('delivery/arm').success, 'arm accepts ready robots and clear shared areas')
 n.tick()
-ok(sum(len(a.sent) for a in ACTIONS.values())==1, 'arm permits exactly one pickup goal')
+ok(sum(len(a.sent) for name,a in ACTIONS.items() if name.endswith('/navigate_to_pose'))==1,
+   'arm permits exactly one pickup goal')
 h=n.pickup; n.robots[h].pose_seen=time.monotonic()-n.pose_timeout-1
 n.tick()
 ok(n.robots[h].state=='STOPPING', 'localization loss during navigation requests Nav2 cancellation')
@@ -332,6 +349,68 @@ Client.ready=True
 n=mk(dry_run=True, robots='a,b,c', nav_action='/{robot}/nav', home_slot_offset=0.0)
 ok(list(n.robots)==['a','b','c'] and '/c/nav' in ACTIONS,'robots and nav_action params')
 ok(n.home_slot_pose(1)==n.home_slot_pose(0),'home_slot_offset 0 -> same HOME pose')
+
+# --- real battery data participates in allocation; missing/low data is not eligible
+n=mk(dry_run=False, battery_required=True)
+for name, value in (('pinky_1', 0.21), ('pinky_2', 0.90)):
+    n._sub[f'/{name}/battery_state'](NS(percentage=value))
+n.call('delivery/request_a'); n.tick()
+ok(n.pickup=='pinky_2', 'higher fresh battery wins when distances are similar')
+ok(st(n)['robots']['pinky_2']['battery_percent']==0.9, 'battery percentage is published to GUI status')
+n=mk(dry_run=False, battery_required=True)
+n._sub['/pinky_1/battery_state'](NS(percentage=0.10))
+n.call('delivery/request_a'); n.tick()
+ok(n.pickup is None and len(n.queue)==1, 'low and missing battery robots receive no task')
+n=mk(dry_run=False, battery_required=True, battery_timeout=1.0)
+r=n.robots['pinky_1']; r.state='TO_STORE'; r.battery_percent=0.8
+r.battery_seen=time.monotonic()-2.0
+n.tick()
+ok(r.state=='ERROR' and 'Battery telemetry stale' in r.error,
+   'stale battery telemetry stops an active trip fail-closed')
+
+# --- Nav2 ComputePathToPose has priority over Euclidean fallback
+n=mk(dry_run=False, path_query_wait=1.0)
+n.call('delivery/request_a'); n.tick()
+ok(n.pickup is None, 'allocation briefly waits for Nav2 path costs')
+def fake_path(points):
+    return NS(poses=[NS(pose=NS(position=NS(x=x,y=y))) for x,y in points])
+for name, points in (('pinky_1', [(0,0),(10,0)]), ('pinky_2', [(0,0),(2,0)])):
+    _, future, handle = ACTIONS[f'/{name}/compute_path_to_pose'].sent[0]
+    future.set(handle)
+    handle.res.set(NS(result=NS(path=fake_path(points))))
+n.tick()
+ok(n.pickup=='pinky_2' and n.robots['pinky_2'].path_source=='nav2_path',
+   'shorter real Nav2 path wins allocation')
+
+# --- traffic reservation is integrated before a Nav2 goal
+traffic_cfg=json.dumps({'corridor_axis':[[0,0],[10,0]], 'entry_angle_deg':45,
+                        'exit_angle_deg':135, 'allow_same_direction_following':False})
+n=mk(dry_run=True, dry_run_travel=10.0, traffic_enabled=True, traffic_json=traffic_cfg)
+p1,p2=n.robots['pinky_1'],n.robots['pinky_2']
+ok(n.schedule_move(p1,'STORE','TO_STORE'), 'first move obtains traffic reservation')
+ok(not n.schedule_move(p2,'A','TO_STATION') and p2.state=='WAIT_TRAFFIC',
+   'opposite move waits before Nav2 goal')
+n.arrived(p1); n.tick()
+ok(p2.state=='TO_STATION', 'waiting opposite move starts after corridor release')
+waypoint_cfg=json.dumps({'corridor_axis':[[0,0],[10,0]], 'entry_angle_deg':45,
+                           'exit_angle_deg':135, 'entry_waypoint':[1,2],
+                           'exit_waypoint':[3,4]})
+n=mk(dry_run=True, dry_run_travel=10.0, traffic_enabled=True, traffic_json=waypoint_cfg)
+p1=n.robots['pinky_1']
+n.schedule_move(p1, 'STORE', 'TO_STORE')
+ok(p1.goal_pose[:2] == (1.0, 2.0) and p1.traffic_waypoint_pending,
+   'entry move first targets measured 45-degree gate waypoint')
+n.arrived(p1)
+ok(p1.state=='TO_STORE' and p1.goal_pose==n.points['STORE'] and p1.name in n.traffic.occupants,
+   'gate arrival advances to destination without releasing corridor')
+n.arrived(p1)
+ok(p1.state=='WAIT_LOAD' and p1.name not in n.traffic.occupants,
+   'corridor releases only after final destination')
+try:
+    mk(dry_run=False, traffic_enabled=True, traffic_json='', traffic_file='')
+    raise AssertionError('real traffic started without measured config')
+except ValueError:
+    print('PASS real traffic requires measured corridor config')
 
 
 # --- external allocator (task_allocation/allocator.py) through the bridge

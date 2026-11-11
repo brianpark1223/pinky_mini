@@ -116,13 +116,13 @@ def test_busy_distance_matches_old_case_formula():
     assert abs(e.D - (0.0 + ((3.0 ** 2 + 2.0 ** 2) ** 0.5))) < 1e-6
 
 
-def test_battery_term_is_optional():
+def test_battery_term_is_enabled_and_configurable():
     robots = [Robot("pinky_1", State.IDLE, (0.0, 0.0), battery=20.0),
               Robot("pinky_2", State.IDLE, (0.0, 0.0), battery=90.0)]
-    off = Allocator(ZONES, Config())
-    assert names(off.submit(req(1), robots)) == [("pinky_1", 1)]        # 기본: 배터리 무시
-    on = Allocator(ZONES, Config(w_battery=0.3))
-    assert names(on.submit(req(1), robots)) == [("pinky_2", 1)]
+    on = Allocator(ZONES, Config())
+    assert names(on.submit(req(1), robots)) == [("pinky_2", 1)]        # 기본: 실제 배터리 반영
+    off = Allocator(ZONES, Config(w_battery=0.0))
+    assert names(off.submit(req(1), robots)) == [("pinky_1", 1)]       # 필요하면 명시적으로 끌 수 있음
 
 
 if __name__ == "__main__":
