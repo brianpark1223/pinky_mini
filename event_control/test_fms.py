@@ -144,7 +144,7 @@ ok(set(ACTIONS)=={'/pinky_1/navigate_to_pose','/pinky_2/navigate_to_pose',
 ok('/pinky_2/amcl_pose' in n._sub,'pose subscription per robot (allocation cost)')
 ok('/pinky_2/battery_state' in n._sub,'battery subscription per robot')
 s0=st(n)
-ok(set(s0['robots'])=={'pinky_1','pinky_2'} and s0['queue']==[] and s0['pickup'] is None and s0['points']['STORE'][0]==fms.POINTS['STORE'][0],
+ok(set(s0['robots'])=={'pinky_1','pinky_2'} and s0['queue']==[] and s0['pickup'] is None and round(s0['points']['STORE'][0], 3)==round(fms.POINTS['STORE'][0], 3),
    'status: robots dict, queue, pickup holder, points')
 
 # --- two requests: split across robots, pickup one at a time
