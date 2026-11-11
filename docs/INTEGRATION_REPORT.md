@@ -28,7 +28,7 @@ flowchart LR
 
 - ROS 2 Jazzy，`ROS_DOMAIN_ID=42`，地图服务器 active，当前地图为 `sesac_gangnam_2.yaml`。
 - 检查时 `/pinky_1/amcl_pose`、`/pinky_2/amcl_pose`、两车 Nav2 action server 和 map 到机器人 TF 均不存在，因此不能进行实车导航测试。
-- `192.168.14.91` 可 ping、TCP 22 可连接且是 Ubuntu OpenSSH；当前非交互检查没有 SSH 凭据，尚不能把它正式确认为 Pinky-1。Pinky-2 IP 未知且保持可配置。
+- 用户确认 Pinky-1 地址为 `192.168.14.91`、Pinky-2 地址为 `192.168.14.90`。`scripts/check_system.sh` 默认检查这两个地址，也可用 `PINKY1_HOST` / `PINKY2_HOST` 覆盖。当前工作环境无法访问机器人网络，因此本次没有重新验证 ping、SSH 或 ROS 状态；地址归属以用户提供的信息为准。
 - 所有测试都未发送实体机器人运动命令。
 
 ## Cost 数据

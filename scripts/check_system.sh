@@ -29,9 +29,15 @@ for frame in pinky_1/base_footprint pinky_2/base_footprint; do
     echo "map -> $frame MISSING"
   fi
 done
-echo "--- Pinky 1 candidate"
-if ping -c 1 -W 1 192.168.14.91 >/dev/null 2>&1; then
-  echo "192.168.14.91 reachable"
-else
-  echo "192.168.14.91 unreachable"
-fi
+PINKY1_HOST="${PINKY1_HOST:-192.168.14.91}"
+PINKY2_HOST="${PINKY2_HOST:-192.168.14.90}"
+echo "--- Pinky robot network reachability (user-configured addresses)"
+for entry in "Pinky 1:$PINKY1_HOST" "Pinky 2:$PINKY2_HOST"; do
+  name="${entry%%:*}"
+  host="${entry#*:}"
+  if ping -c 1 -W 1 "$host" >/dev/null 2>&1; then
+    echo "$name ($host) reachable by ping; robot identity/ROS health not verified"
+  else
+    echo "$name ($host) unreachable by ping"
+  fi
+done
