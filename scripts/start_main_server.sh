@@ -19,17 +19,17 @@ while (($#)); do
     --points) POINTS="$2"; shift ;;
     --home-slots) HOME_SLOTS="$2"; shift ;;
     --traffic) TRAFFIC="$2"; shift ;;
-    *) echo "未知参数: $1" >&2; exit 2 ;;
+    *) echo "알 수 없는 옵션: $1" >&2; exit 2 ;;
   esac
   shift
 done
 
 if $REAL && [[ -z "$POINTS" || -z "$HOME_SLOTS" || -z "$TRAFFIC" ]]; then
-  echo "实车模式需要 --points、--home-slots、--traffic 三个实测配置文件。" >&2
+  echo "실차 모드에는 --points, --home-slots, --traffic 실측 설정 파일이 필요합니다." >&2
   exit 2
 fi
 for path in "$MAP" ${POINTS:+"$POINTS"} ${HOME_SLOTS:+"$HOME_SLOTS"} ${TRAFFIC:+"$TRAFFIC"}; do
-  [[ -f "$path" ]] || { echo "文件不存在: $path" >&2; exit 2; }
+  [[ -f "$path" ]] || { echo "파일을 찾을 수 없습니다: $path" >&2; exit 2; }
 done
 
 # A previously sourced/broken workspace can make the Jazzy setup try to load a
@@ -42,7 +42,7 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
 export ROS_AUTOMATIC_DISCOVERY_RANGE="${ROS_AUTOMATIC_DISCOVERY_RANGE:-SUBNET}"
 
 if ros2 node list 2>/dev/null | grep -Eq '^/(map_server|lifecycle_manager|fms_controller|delivery_gui)$'; then
-  echo "检测到主服务器节点已运行。请先关闭旧进程，避免重复发布和重复派单。" >&2
+  echo "중앙 서버 노드가 이미 실행 중입니다. 중복 발행과 배정을 막기 위해 기존 프로세스를 먼저 종료하세요." >&2
   ros2 node list | grep -E '^/(map_server|lifecycle_manager|fms_controller|delivery_gui)$' >&2 || true
   exit 3
 fi
@@ -66,7 +66,7 @@ trap stop_all INT TERM EXIT
 
 start() {
   local name="$1"; shift
-  echo "启动 $name，日志: $LOG_DIR/$name.log"
+  echo "$name 시작, 로그: $LOG_DIR/$name.log"
   "$@" >"$LOG_DIR/$name.log" 2>&1 &
   pids+=("$!")
 }
@@ -80,7 +80,7 @@ for _ in {1..50}; do
   if ros2 lifecycle get /map_server 2>/dev/null | grep -q active; then ready=true; break; fi
   sleep 0.2
 done
-$ready || { echo "地图服务器未进入 active，检查 $LOG_DIR/map_server.log" >&2; exit 4; }
+$ready || { echo "지도 서버가 활성 상태가 아닙니다. $LOG_DIR/map_server.log를 확인하세요." >&2; exit 4; }
 
 fms=(python3 "$ROOT/event_control/fms_controller.py" --ros-args -p docking:=false)
 if $REAL; then
@@ -99,9 +99,9 @@ if $RVIZ; then
   start rviz rviz2 -d "$ROOT/pinky_mission/rviz/pinky_mission.rviz"
 fi
 
-echo "Pinky 主服务器已启动。模式: $($REAL && echo '实车(未 armed)' || echo 'dry_run')"
-echo "状态: ros2 topic echo /delivery/status"
-echo "停止全部模块: Ctrl+C"
+echo "Pinky 중앙 서버를 시작했습니다. 모드: $($REAL && echo '실차(FMS 비활성)' || echo '모의 실행')"
+echo "상태 확인: ros2 topic echo /delivery/status"
+echo "모든 모듈 중지: Ctrl+C"
 wait -n "${pids[@]}"
-echo "某个模块已退出，主服务器正在统一关闭。" >&2
+echo "모듈 하나가 종료되어 중앙 서버의 나머지 프로세스도 함께 종료합니다." >&2
 exit 5
