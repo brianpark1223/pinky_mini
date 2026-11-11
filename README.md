@@ -153,8 +153,8 @@ stateDiagram-v2
 │   └── test_*.py          # ROS 모의 테스트
 ├── aruco_docking/         # 도킹 노드 추가 예정
 ├── task_allocation/
-│   ├── README.md          # 배정 함수의 입력·출력 계약
-│   └── allocator.py       # Cost 배정 알고리즘 및 픽업 순서
+│   ├── README.md          # Cost 식과 Allocator 연결 계약
+│   └── allocator.py       # 거리·대기 시간 Cost 배정 클래스
 ├── config/                # 공통 설정 분리 예정
 ├── launch/                # ROS2 통합 실행 파일 추가 예정
 ├── tests/                 # 테스트 분리용 안내 (현재 테스트는 event_control/)
@@ -163,7 +163,8 @@ stateDiagram-v2
     └── images/            # GUI 화면 캡처
 ```
 
-배정 담당자는 `task_allocation/allocator.py`의 `assign()`, `pickup_order()`를 수정합니다.
+배정 담당자는 `task_allocation/allocator.py`의 `Allocator` 클래스에서 Cost 식과 `dispatch()`, `next_for()`를 수정합니다.
+기본 가중치는 거리 0.6·대기 시간 0.4이며, 픽업대 순서는 연결부의 기본 대기 순서를 사용합니다.
 FMS는 `event_control/task_allocation.py` 연결부를 통해 호출하며, 모듈 로딩·실행 오류나 잘못된 반환값에는 기본 규칙을 사용합니다.
 ArUco 도킹 노드는 아직 포함되지 않았으며, 시작 서비스와 피드백 토픽으로 연결합니다.
 실제 모듈 간 약속은 [이벤트 제어 README의 팀 인터페이스](event_control/README.md#팀-인터페이스-이것만-지키면-각자-수정해도-연동됨)를 기준으로 합니다.
@@ -195,7 +196,7 @@ PINKY_QT=6 python3 delivery_gui.py                      # PyQt6 사용 시
 | 항목 | 상태 |
 |---|---|
 | 2대 FMS 컨트롤러 (로봇별 상태 머신, 픽업대·작업대 점유, 정지 확인, 오류 격리) | 로직 테스트 완료 · 실차 미검증 |
-| 작업 배정 기본 규칙 (픽업대에 가장 가까운 로봇, 먼저 기다린 순) | 완료 · cost 고도화 진행 중 |
+| Cost 기반 작업 배정 (거리·대기 시간, 수령 후 다음 작업 연결) | 구현 · 모의 테스트 검증, 실차 미검증 |
 | 관제 GUI (1대·2대, 도착 시간 예측, 실시간 지도) | 완료 |
 | 로봇 알림음 · 전방 근접 경고음 | 완료 |
 | ArUco 도킹 노드 (컨트롤러 연결부는 완료) | 진행 중 |

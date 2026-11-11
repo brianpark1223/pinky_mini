@@ -10,7 +10,7 @@ ROS2 Jazzy / Python3. 의존 패키지: rclpy, nav2_msgs, action_msgs, std_msgs,
 |---|---|---|---|
 | `fms_sim.py` | - | 노트북 | **모의 실행**: 동일 컨트롤러를 `dry_run:=true`로 실행, Nav2 주행 goal을 보내지 않음 |
 | `fms_controller.py` | - | 노트북 | **2대용 FMS 컨트롤러**: 로봇별 상태 머신, 로봇별 Nav2, 픽업대 점유, 수납대 자리 나눔, ArUco 도킹 연결 |
-| `task_allocation.py` | - | (컨트롤러가 불러씀) | **작업 배정 연결부**: 레포의 `task_allocation/allocator.py`(cost 알고리즘)가 있으면 그걸 쓰고, 없거나 오류면 기본 규칙(가까운 로봇 · 먼저 온 순) 사용 |
+| `task_allocation.py` | - | (컨트롤러가 불러씀) | **작업 배정 연결부**: 외부 `Allocator.dispatch()`·`next_for()` 호출, 오류 시 기본 규칙 사용 |
 | `parts_delivery.py` | 1, 4(로직), 6 | 로봇 또는 노트북 | 1대용 컨트롤러 (로봇 한 대 시험용) |
 | `robot_notifier.py` | 3, 5 | **로봇** (스피커가 달린 쪽) | 대기 상태 진입 시 노래, 주행 중 전방 근접 시 삐빅 |
 | `delivery_gui.py` | 4(GUI) | 노트북 | 요청/확인 버튼, 로봇·작업 상태, 카메라, 로그, RViz 실행 |
@@ -74,7 +74,7 @@ GUI는 `robots` 필드가 있으면 2대 화면, 없으면 위의 1대 형식으
 | 요청 서비스 | `delivery/request_a`, `delivery/request_b` (공용, 그대로) |
 | 로봇별 서비스 | `delivery/<robot>/loaded`, `delivery/<robot>/received`, `delivery/<robot>/retry`, `delivery/<robot>/reset` |
 | 로봇 상태 | 1대와 같음 + `WAIT_PICKUP` (픽업대를 다른 Pinky가 쓰는 중 → 그 자리에 멈춰 대기) + `DOCKING` (픽업대 앞 ArUco 정렬 중, `docking:=true`일 때) |
-| 배정 | 대기열은 하나. 비어 있는(IDLE 또는 수납대로 복귀 중인) Pinky에 `task_allocation.assign()`이 정한 대로 줌. 기본 규칙 = 요청 순서대로, 픽업대에 가장 가까운 Pinky. 맡긴 작업에는 `robot` 필드가 붙음 |
+| 배정 | 컨트롤러의 대기열 하나가 기준. Nav2·위치·goal 상태가 준비된 IDLE 로봇에 `Allocator.dispatch()`가 거리·대기 시간 Cost로 배정. 수령 후에는 잠기지 않고 비어 있는 작업대의 요청을 `next_for()`로 이어받음. 복귀 중인 로봇의 goal은 선점하지 않음 |
 | 픽업대 | 한 번에 한 대(`pickup` = 점유한 로봇). 출발할 때 점유를 잡고 적재 후 지도 위치가 픽업대 반경 밖으로 벗어난 것이 확인될 때 풂. 기다리는 Pinky는 차례대로 진입 |
 | 수납대 | 1곳을 자리 2개로 나눠 씀: 첫 번째 = `HOME`, 두 번째 = `HOME`에서 왼쪽으로 `home_slot_offset`(0.35 m). 0이면 둘 다 `HOME` |
 | 오류 | 그 로봇만 `ERROR`. Nav2 실패·취소는 최종 결과를 확인하고, 픽업대·작업대 잠금은 새로운 지도 위치로 이탈이 확인될 때 풂. 결과가 불명확하면 잠금을 유지하고 현장 확인 필요 |
@@ -304,6 +304,8 @@ ros2 service call /delivery/reset std_srvs/srv/Trigger '{}'
 - 이 노드 실행 중 RViz 등에서 별도 Nav2 목적지를 보내지 마세요.
 
 ## 검증 범위
+
+- `test_alloc_merge.py`: 클래스 배정기 로딩·파라미터 전달·작업 연결·작업대 잠금·arm 전 goal 차단·STOPPING 제외·기본 규칙 전환을 검증합니다. `event_control/`에서 `python3 test_alloc_merge.py fms_controller.py`로 실행합니다.
 
 ROS 없이 가짜 rclpy로 검증했습니다 (`python3 test_fms.py fms_controller.py` 등).
 - `test_sim.py`: 모의 실행 진입점의 기본 설정·옵션 전달·ROS 인자 종료 구분자 처리 검증. 저장소 루트에서 `python3 -m unittest discover -s event_control -p test_sim.py`로 실행합니다.
