@@ -74,9 +74,9 @@ GUI는 `robots` 필드가 있으면 2대 화면, 없으면 위의 1대 형식으
 | 로봇별 서비스 | `delivery/<robot>/loaded`, `delivery/<robot>/received`, `delivery/<robot>/retry`, `delivery/<robot>/reset` |
 | 로봇 상태 | 1대와 같음 + `WAIT_PICKUP` (픽업대를 다른 Pinky가 쓰는 중 → 그 자리에 멈춰 대기) + `DOCKING` (픽업대 앞 ArUco 정렬 중, `docking:=true`일 때) |
 | 배정 | 대기열은 하나. 비어 있는(IDLE 또는 수납대로 복귀 중인) Pinky에 `task_allocation.assign()`이 정한 대로 줌. 기본 규칙 = 요청 순서대로, 픽업대에 가장 가까운 Pinky. 맡긴 작업에는 `robot` 필드가 붙음 |
-| 픽업대 | 한 번에 한 대(`pickup` = 점유한 로봇). 출발할 때 점유를 잡고 [적재 완료]로 떠날 때 풂. 기다리는 Pinky가 여럿이면 `task_allocation.pickup_order()` 순서(기본: 먼저 기다린 순) |
+| 픽업대 | 한 번에 한 대(`pickup` = 점유한 로봇). 출발할 때 점유를 잡고 적재 후 지도 위치가 픽업대 반경 밖으로 벗어난 것이 확인될 때 풂. 기다리는 Pinky는 차례대로 진입 |
 | 수납대 | 1곳을 자리 2개로 나눠 씀: 첫 번째 = `HOME`, 두 번째 = `HOME`에서 왼쪽으로 `home_slot_offset`(0.35 m). 0이면 둘 다 `HOME` |
-| 오류 | 그 로봇만 `ERROR`. 픽업대로 가다 실패하면 점유를 풀어 다른 로봇이 쓰게 함. 도킹 중 실패하면 로봇이 픽업대에 있으므로 점유 유지 → 재시도 또는 취소. 취소하면 할 일이 없을 때 수납대로 돌아감 |
+| 오류 | 그 로봇만 `ERROR`. Nav2 실패·취소는 최종 결과를 확인하고, 픽업대·작업대 잠금은 새로운 지도 위치로 이탈이 확인될 때 풂. 결과가 불명확하면 잠금을 유지하고 현장 확인 필요 |
 | 로봇별 토픽 | `/<robot>/amcl_pose`, `/<robot>/plan`, `/<robot>/delivery/dock`, `/<robot>/camera/image_raw/compressed` (Nav2를 로봇별 namespace로 띄우면 이 이름이 됨). TF는 `<robot>/base_footprint`(frame_prefix)가 있으면 사용 |
 
 GUI는 대기열 작업마다 어느 Pinky가 맡을지, 픽업대가 겹칠 때 기다리는 시간까지 넣어 도착 시간을 예상합니다.
@@ -221,7 +221,7 @@ python3 delivery_gui.py --ros-args -p station_labels:='작업대1,작업대2' \
 | 주행 실패 후 | ERROR에서 빠져나올 수 없음 → 재시작 필요, 대기열 소실 | `/delivery/retry`, `/delivery/reset` 추가 |
 | Nav2 준비 전 요청 | 즉시 ERROR | Nav2가 준비될 때까지 IDLE에서 대기 (5초마다 경고 로그) |
 | Nav2 무응답 | 영원히 이동 중 상태 | `nav_timeout`(기본 90초) 초과 시 goal 취소 후 ERROR |
-| 복귀 중 새 요청 | HOME 도착 후 출발 | 복귀를 버리고 바로 보관소로 출발 |
+| 복귀 중 새 요청 | HOME 도착 후 출발 | 현재 복귀 goal 완료 후 출발 (충돌 goal 방지) |
 | ERROR 중 요청 | 거절 | 대기열에 추가 (복구 후 처리) |
 | 상태 토픽 | state/current/queue | + target, error, nav_ready, timeout_left |
 
@@ -249,22 +249,32 @@ ros2 service call /delivery/pinky_1/received std_srvs/srv/Trigger '{}'
 
 ## 2. 실제 Nav2 연동
 
-1. `fms_controller.py`의 POINTS(STORE, A, B, HOME)를 실제 지도 좌표(x m, y m, yaw rad)로 수정합니다.
-   RViz의 "2D Goal Pose"로 각 지점에 단독 주행이 되는지 먼저 확인하세요.
-2. 각 Pinky의 bringup과 Nav2를 namespace(`/pinky_1`, `/pinky_2`)로 실행하고, 로봇마다 초기 위치(2D Pose Estimate)를 맞춥니다.
-   `ros2 action list`에 `/pinky_1/navigate_to_pose`, `/pinky_2/navigate_to_pose`가 보여야 합니다.
-3. 모의 실행 프로세스를 종료합니다. 같은 노드를 중복 실행하지 마세요.
+1. `points.template.json`과 `home_slots.template.json`을 복사해 STORE, A, B, HOME 및 로봇별 HOME 주차 위치의 **실측** 지도 좌표(x m, y m, yaw rad)를 채웁니다. 두 주차 위치는 `home_min_separation`(기본 0.5 m)보다 떨어져야 합니다. 원본 예시 좌표와 기본 `home_slot_offset`은 실주행에 사용할 수 없습니다. 접근 가능한 free space, 로봇 외형과 목표 방향을 현장에서 확인합니다.
+2. 각 Pinky의 SLAM/지도·Nav2를 namespace(`/pinky_1`, `/pinky_2`)로 실행하고, 로봇마다 map 좌표 위치를 확인합니다. 두 차가 같은 지도 좌표계를 사용해야 합니다. `ros2 action list -t`에서 두 `NavigateToPose` action, `ros2 topic list -t`에서 두 `amcl_pose`가 보여야 합니다.
+3. 모의 실행 프로세스를 종료합니다. 같은 컨트롤러를 중복 실행하지 마세요. 실차는 안전 담당자가 물리적 정지 수단을 확보한 뒤에만 진행합니다.
 
 ```bash
-python3 fms_controller.py --ros-args -p dry_run:=false
-# ArUco 도킹 노드가 준비되면
-python3 fms_controller.py --ros-args -p dry_run:=false -p docking:=true
+python3 fms_controller.py --ros-args -p dry_run:=false \
+    -p points_file:=/absolute/path/to/measured_points.json \
+    -p home_slots_file:=/absolute/path/to/measured_home_slots.json -p docking:=false
 # 로봇 이름 / Nav2 action 이름 / 위치 토픽이 다를 때
 python3 fms_controller.py --ros-args -p dry_run:=false -p robots:=pinky_a,pinky_b \
+    -p points_file:=/absolute/path/to/measured_points.json \
+    -p home_slots_file:=/absolute/path/to/measured_home_slots.json \
     -p nav_action:='/{robot}/navigate_to_pose' -p pose_topic:='/{robot}/amcl_pose'
 # 1대만 시험할 때
 python3 parts_delivery.py --ros-args -p dry_run:=false
 ```
+
+실주행 모드는 시작해도 `armed=false`로 대기합니다. 상태 토픽에서 두 로봇의 `pose_ready`, `nav_ready`와 `pickup_clear`를 먼저 확인하세요. AMCL 위치 갱신이 3초 넘게 없으면 기본 설정에서는 출발을 막거나 진행 중인 Nav2 goal 취소를 요청합니다. 정지 상태에서 AMCL 갱신이 드문 환경은 `pose_timeout`을 현장 데이터에 맞춰 조정하거나 지속적인 map 위치 토픽을 사용해야 합니다. 취소 완료와 실제 물리적 정지는 별도로 확인해야 합니다.
+
+```bash
+ros2 topic echo /delivery/status std_msgs/msg/String --once
+ros2 service call /delivery/arm std_srvs/srv/Trigger '{}'
+ros2 service call /delivery/disarm std_srvs/srv/Trigger '{}'  # 새 배정 중지 및 진행 중 Nav2 goal 취소 요청
+```
+
+한 작업대에는 한 차만 배정하고, 픽업대도 한 차만 사용합니다. 수령 완료 직후 작업대 잠금은 유지되며 로봇이 지도 위치상 그 반경을 벗어난 뒤 해제됩니다. Nav2 result가 확인되지 않으면 해당 로봇은 `ERROR`로 남고 재시도·초기화가 막힙니다. 현장에서 로봇 정지와 Nav2 goal 상태를 확인하고 컨트롤러를 재시작해야 합니다. `/delivery/disarm`은 물리적 비상 정지 명령이 아닙니다.
 
 ## 3. 오류가 났을 때
 
@@ -287,7 +297,8 @@ ros2 service call /delivery/reset std_srvs/srv/Trigger '{}'
 - 한 요청 = 목적지 작업대에 대한 배송 1건. 품목/수량/재고는 없습니다.
 - 적재/하역은 사람이 하고 서비스 호출로 확인합니다.
 - 자동 충전, 개별 작업 취소, 영구 작업 이력, 재시작 후 복구는 미구현입니다.
-- 프로세스 종료는 로봇 정지 명령이 아닙니다. 실물 정지는 로봇 자체 정지 절차를 사용하세요.
+- 프로세스 종료 시 알려진 Nav2 goal 취소를 요청하지만 완료를 보장하지 않습니다. 실물 정지는 로봇 자체 정지 절차를 사용하세요.
+- 공용 통로 전체의 교통 잠금, 두 로봇 간 직접 충돌 회피, 정적·동적 costmap의 목표 유효성 검사는 이 컨트롤러에 없습니다. Nav2 자체의 경로 계획·회피를 현장에서 별도 확인해야 합니다. 이 코드는 두 차가 같은 구역에 있을 때의 안전을 보증하지 않습니다.
 - 이 노드 실행 중 RViz 등에서 별도 Nav2 목적지를 보내지 마세요.
 
 ## 검증 범위

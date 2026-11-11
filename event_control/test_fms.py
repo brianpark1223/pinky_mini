@@ -1,4 +1,5 @@
 import sys, types, time, importlib.util
+import tempfile
 
 # ---- fake ROS modules ----
 class Fut:
@@ -39,7 +40,9 @@ class Client:
 class Handle:
     def __init__(s): s.accepted=True; s.res=Fut(); s.cancelled=False
     def get_result_async(s): return s.res
-    def cancel_goal_async(s): s.cancelled=True
+    def cancel_goal_async(s):
+        s.cancelled=True
+        f=Fut(); f.set(NS(goals_canceling=[1])); return f
 
 ACTIONS={}
 class ActionClient:
@@ -60,6 +63,7 @@ def mod(n,**kw):
     m=types.ModuleType(n); m.__dict__.update(kw); sys.modules[n]=m
 mod('rclpy', init=lambda:None, spin=lambda n:None, ok=lambda:True, shutdown=lambda:None)
 mod('rclpy.action', ActionClient=ActionClient); mod('rclpy.node', Node=Node)
+mod('rclpy.signals', SignalHandlerOptions=types.SimpleNamespace(NO=0))
 mod('action_msgs'); mod('action_msgs.msg', GoalStatus=types.SimpleNamespace(STATUS_SUCCEEDED=4, STATUS_ABORTED=6))
 mod('geometry_msgs'); mod('geometry_msgs.msg', PoseStamped=object, PointStamped=object, PoseWithCovarianceStamped=object)
 TFPOSE={'p':None}
@@ -83,7 +87,18 @@ spec=importlib.util.spec_from_file_location('fms', sys.argv[1]); fms=importlib.u
 NS=types.SimpleNamespace
 
 def mk(**p):
-    PARAMS.clear(); PARAMS.update(p); ACTIONS.clear(); CLIENTS.clear(); return fms.FmsController()
+    if p.get('dry_run') is False:
+        p.setdefault('points_json', json.dumps(fms.POINTS))
+        p.setdefault('home_slots_json', json.dumps([[0.6,0.2,1.57],[1.4,0.2,1.57]]))
+        p.setdefault('station_clearance', 0.2)  # sample HOME and B are close; tests use virtual poses
+    PARAMS.clear(); PARAMS.update(p); ACTIONS.clear(); CLIENTS.clear()
+    n=fms.FmsController()
+    if not n.dry_run:
+        for r in n.robots.values():
+            r.pose=n.home_slot_pose(r.home_slot)[:2]
+            r.pose_seen=time.monotonic()
+        n.armed=True  # test harness simulates the operator's explicit arm
+    return n
 def ok(c,msg):
     assert c, msg; print('PASS', msg)
 def st(n): n.publish_status(); return json.loads(STATUS[-1])
@@ -115,9 +130,11 @@ n.tick()
 ok(n.robots[holder].state=='WAIT_LOAD' and n.robots[other].state=='WAIT_PICKUP','holder arrives, other keeps waiting')
 r=n.call(f'delivery/{other}/loaded'); ok(not r.success,'loaded on the waiting robot is refused')
 n.call(f'delivery/{holder}/loaded')
-ok(n.robots[holder].state=='TO_STATION' and n.pickup is None,'loaded -> leaves, pickup released')
+ok(n.robots[holder].state=='TO_STATION' and n.pickup==holder,'loaded -> outbound goal, pickup remains locked')
 n.tick()
-ok(n.robots[other].state in ('TO_STORE','WAIT_LOAD') and n.pickup==other,'waiting robot enters the pickup')
+ok(n.pickup is None and n.robots[other].state=='WAIT_PICKUP','outbound robot clears pickup, waiter still held')
+n.tick()
+ok(n.robots[other].state=='TO_STORE' and n.pickup==other,'waiting robot enters after clearance')
 n.tick()
 ok(n.robots[holder].state=='WAIT_RECEIVE' and n.robots[other].state=='WAIT_LOAD','both progress independently')
 n.call(f'delivery/{holder}/received'); n.tick()
@@ -140,15 +157,17 @@ ok(fms.task_allocation.assign({'x':{'pose':None},'y':{'pose':(0,0)}},[{'id':1}],
    'unknown pose is chosen last')
 ok(fms.task_allocation.pickup_order({'a':{'since':5},'b':{'since':3}},{})=='b','pickup: first come first served')
 
-# --- busy robot not reassigned, TO_HOME preempted
+# --- busy robot not reassigned; return trip is not preempted by a conflicting goal
 n=mk(dry_run=True, dry_run_travel=0.0)
 n.call('delivery/request_a'); n.tick(); n.tick()
 busy=n.pickup; idle=[k for k in n.robots if k!=busy][0]
 n.call(f'delivery/{busy}/loaded'); n.tick(); n.call(f'delivery/{busy}/received'); n.tick()
 ok(n.robots[busy].state=='TO_HOME','robot heading home')
 n.robots[busy].pose=(fms.POINTS['STORE'][0]+0.2,fms.POINTS['STORE'][1])
+n.robots[busy].nav_deadline=time.monotonic()+10
 n.call('delivery/request_b'); n.tick()
-ok(n.robots[busy].state=='TO_STORE' and n.robots[busy].home_slot is None,'TO_HOME robot can be preempted by a new request (cost)')
+ok(n.robots[busy].state=='TO_HOME' and n.robots[idle].state in ('TO_STORE', 'WAIT_PICKUP'),
+   'TO_HOME robot keeps its goal; idle robot takes new task')
 
 # --- error on one robot does not stop the other; lock released if not at the pickup
 n=mk(dry_run=False)
@@ -157,7 +176,9 @@ h=n.pickup; w=[k for k in n.robots if k!=h][0]
 act=ACTIONS[f'/{h}/navigate_to_pose']
 ok(len(act.sent)==1 and abs(act.sent[0][0].pose.pose.position.x-fms.POINTS['STORE'][0])<1e-9,'real mode: goal to STORE on that robot\'s Nav2')
 goal,f,hd=act.sent[0]; f.set(hd); hd.res.set(NS(status=6))
-ok(n.robots[h].state=='ERROR' and n.pickup is None,'Nav2 abort -> ERROR, pickup released (not there yet)')
+ok(n.robots[h].state=='ERROR' and n.pickup==h,'Nav2 abort keeps pickup locked until a new localization sample proves clearance')
+n.robots[h].pose_seen=time.monotonic(); n.tick()
+ok(n.pickup is None,'new localization sample outside pickup releases lock')
 n.tick()
 ok(n.robots[w].state=='TO_STORE' and n.pickup==w,'other robot continues into the pickup')
 r=n.call(f'delivery/{h}/retry')
@@ -166,9 +187,16 @@ r=n.call(f'delivery/{h}/reset'); n.tick()
 ok(n.robots[h].current is None and n.robots[h].state in ('IDLE','TO_HOME'),'reset drops the task')
 
 # --- timeout per robot
-n=mk(dry_run=False, nav_timeout=0.0)
-n.call('delivery/request_a'); n.tick(); n.tick()
-ok(any(r.state=='ERROR' and 'timeout' in r.error for r in n.robots.values()),'navigation timeout -> ERROR on that robot')
+n=mk(dry_run=False, nav_timeout=0.001)
+n.call('delivery/request_a'); n.tick(); time.sleep(0.003); n.tick()
+h=n.pickup; goal,f,hd=ACTIONS[f'/{h}/navigate_to_pose'].sent[0]
+ok(n.robots[h].state=='STOPPING' and n.robots[h].goal_pending,
+   'navigation timeout waits for pending Nav2 goal response')
+f.set(hd)
+ok(hd.cancelled and n.robots[h].state=='STOPPING', 'late accepted goal is cancelled')
+hd.res.set(NS(status=5))
+ok(n.robots[h].state=='ERROR' and 'timeout' in n.robots[h].error,
+   'navigation timeout -> ERROR only after terminal Nav2 result')
 
 # --- feedback distance per robot, stale callbacks ignored
 n=mk(dry_run=False)
@@ -178,8 +206,84 @@ act.fb(NS(feedback=NS(distance_remaining=1.234)))
 ok(st(n)['robots'][h]['distance_remaining']==1.23,'Nav2 distance_remaining per robot')
 goal,f,hd=act.sent[0]; f.set(hd)
 n.call(f'delivery/{h}/reset')
+ok(n.robots[h].state=='STOPPING', 'reset waits for goal cancellation')
 hd.res.set(NS(status=4))
 ok(n.robots[h].state in ('IDLE','TO_HOME'),'late result after reset ignored')
+
+# --- two requests for the same station never overlap
+n=mk(dry_run=True, dry_run_travel=0.0)
+n.call('delivery/request_a'); n.call('delivery/request_a'); n.tick()
+owner=n.station_owners['A']; other=[name for name in n.robots if name!=owner][0]
+ok(owner is not None and n.robots[other].state=='IDLE' and len(n.queue)==1,
+   'second request to occupied station remains queued')
+n.tick(); n.call(f'delivery/{owner}/loaded'); n.tick(); n.tick()
+n.call(f'delivery/{owner}/received'); n.tick()
+ok(n.station_owners['A']==owner and len(n.queue)==1,
+   'receiving a delivery does not release the station while robot is still there')
+n.tick()
+ok(n.station_owners['A'] is not None and not n.queue and n.robots[n.station_owners['A']].state=='TO_STORE',
+   'station releases after departure and the second request is then assigned')
+
+# --- real mode is inert until explicitly armed, and stale localization blocks motion
+n=mk(dry_run=False)
+n.armed=False
+n.call('delivery/request_a'); n.tick()
+ok(all(not a.sent for a in ACTIONS.values()) and len(n.queue)==1,
+   'real mode does not send a goal before arm')
+n.robots['pinky_2'].pose_seen=time.monotonic()-n.pose_timeout-1
+ok(not n.call('delivery/arm').success, 'arm rejects stale localization')
+n.robots['pinky_2'].pose_seen=time.monotonic()
+ok(n.call('delivery/arm').success, 'arm accepts ready robots and clear shared areas')
+n.tick()
+ok(sum(len(a.sent) for a in ACTIONS.values())==1, 'arm permits exactly one pickup goal')
+h=n.pickup; n.robots[h].pose_seen=time.monotonic()-n.pose_timeout-1
+n.tick()
+ok(n.robots[h].state=='STOPPING', 'localization loss during navigation requests Nav2 cancellation')
+n=mk(dry_run=True, dry_run_travel=0.0)
+n.call('delivery/request_a'); n.tick(); n.tick(); h=n.pickup
+n.call('delivery/disarm')
+ok(not n.call(f'delivery/{h}/loaded').success and n.robots[h].state=='WAIT_LOAD',
+   'disarm blocks loaded service from sending another navigation goal')
+ok(n.call('delivery/arm').success, 'stopped task can be armed again while it owns pickup')
+ok(n.call(f'delivery/{h}/loaded').success, 'loaded service resumes after arm')
+n=mk(dry_run=False)
+n.call('delivery/request_a'); n.tick(); h=n.pickup
+_,f,hd=ACTIONS[f'/{h}/navigate_to_pose'].sent[0]; f.set(hd); hd.res.set(NS(status=4))
+n.robots[h].pose_seen=time.monotonic()-n.pose_timeout-1
+ok(not n.call(f'delivery/{h}/loaded').success and n.robots[h].state=='WAIT_LOAD',
+   'stale localization blocks outbound goal after loading')
+with tempfile.NamedTemporaryFile(mode='w+', suffix='.json') as points_file:
+    json.dump({k:list(v) for k,v in fms.POINTS.items()}, points_file); points_file.flush()
+    n=mk(dry_run=False, points_file=points_file.name, points_json='')
+    ok(n.points==fms.POINTS, 'measured points file is loaded for real mode')
+try:
+    mk(dry_run=False, points_json='', points_file='')
+    raise AssertionError('real mode accepted example points')
+except ValueError:
+    print('PASS real mode refuses example coordinates without explicit points')
+try:
+    mk(dry_run=False, home_slots_json='', home_slots_file='')
+    raise AssertionError('real mode accepted unmeasured home slots')
+except ValueError:
+    print('PASS real two-robot mode refuses unmeasured home slots')
+
+# --- an unconfirmed result keeps the robot and pickup locked
+n=mk(dry_run=False)
+n.call('delivery/request_a'); n.tick(); h=n.pickup
+_,f,hd=ACTIONS[f'/{h}/navigate_to_pose'].sent[0]; f.set(hd)
+hd.res.result=lambda: (_ for _ in ()).throw(RuntimeError('DDS dropped'))
+hd.res.set(None)
+ok(n.robots[h].state=='ERROR' and n.pickup==h and n.robots[h].stop_reason is not None,
+   'unconfirmed result fails closed and keeps the shared pickup locked')
+ok(not n.call(f'delivery/{h}/reset').success and not n.call(f'delivery/{h}/retry').success,
+   'unconfirmed result cannot be reset or retried through normal services')
+n=mk(dry_run=False)
+n.call('delivery/request_a'); n.tick(); h=n.pickup
+_,f,_=ACTIONS[f'/{h}/navigate_to_pose'].sent[0]
+f.result=lambda: (_ for _ in ()).throw(RuntimeError('DDS dropped'))
+f.set(None)
+ok(n.robots[h].state=='ERROR' and n.pickup==h and n.robots[h].stop_reason is not None,
+   'unconfirmed goal acceptance also fails closed')
 
 # --- docking
 n=mk(dry_run=True, dry_run_travel=0.0, docking=True, dry_run_dock=0.0)
@@ -191,6 +295,7 @@ n.tick(); ok(n.robots[h].state=='WAIT_LOAD','dry run: docking done -> WAIT_LOAD'
 n=mk(dry_run=False, docking=True)
 n.call('delivery/request_a'); n.tick(); h=n.pickup
 goal,f,hd=ACTIONS[f'/{h}/navigate_to_pose'].sent[0]; f.set(hd); hd.res.set(NS(status=4))
+n.robots[h].pose=fms.POINTS['STORE'][:2]; n.robots[h].pose_seen=time.monotonic()
 ok(n.robots[h].state=='DOCKING' and CLIENTS[f'/{h}/delivery/dock_start'].calls==1,'real: dock_start called')
 n._sub[f'/{h}/delivery/dock'](NS(data=json.dumps({'distance':0.1,'angle_deg':3,'visible':True,'state':'running'})))
 ok(n.robots[h].state=='DOCKING','running feedback keeps DOCKING')

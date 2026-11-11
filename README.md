@@ -73,7 +73,7 @@ stateDiagram-v2
     TO_STATION --> WAIT_RECEIVE: 작업대 도착
     WAIT_RECEIVE --> TO_STORE: 수령 완료 (대기열 있음)
     WAIT_RECEIVE --> TO_HOME: 수령 완료 (대기열 없음)
-    TO_HOME --> TO_STORE: 새 요청
+    TO_HOME --> IDLE: 기존 복귀 goal 완료
     TO_HOME --> IDLE: 수납대 도착
     TO_STORE --> ERROR: 주행 실패 / 시간 초과
     TO_STATION --> ERROR: 주행 실패 / 시간 초과
@@ -82,7 +82,7 @@ stateDiagram-v2
     ERROR --> TO_STORE: 재시도
     ERROR --> DOCKING: 재시도
     ERROR --> TO_STATION: 재시도
-    ERROR --> TO_HOME: 재시도
+    ERROR --> TO_STORE: 픽업 단계 재시도
     ERROR --> IDLE: 작업 취소
 ```
 
@@ -179,8 +179,10 @@ python3 robot_notifier.py --ros-args -p robot_name:=pinky_1   # 두 번째 로�
 
 # 관제 노트북 (로봇과 같은 ROS_DOMAIN_ID)
 python3 fms_controller.py                               # 모의 실행 (로봇이 움직이지 않음)
-python3 fms_controller.py --ros-args -p dry_run:=false  # 실제 주행
-python3 fms_controller.py --ros-args -p dry_run:=false -p docking:=true   # ArUco 도킹 포함
+python3 fms_controller.py --ros-args -p dry_run:=false \
+    -p points_file:=/absolute/path/to/measured_points.json \
+    -p home_slots_file:=/absolute/path/to/measured_home_slots.json
+# 실주행은 별도 /delivery/arm 서비스 호출 전까지 시작되지 않음
 PINKY_QT=6 python3 delivery_gui.py                      # PyQt6 사용 시
 ```
 
@@ -191,7 +193,7 @@ PINKY_QT=6 python3 delivery_gui.py                      # PyQt6 사용 시
 
 | 항목 | 상태 |
 |---|---|
-| 2대 FMS 컨트롤러 (로봇별 상태 머신, 픽업대 점유, 수납대 자리 나눔, 오류 격리) | 완료 (모의 실행 검증) |
+| 2대 FMS 컨트롤러 (로봇별 상태 머신, 픽업대·작업대 점유, 정지 확인, 오류 격리) | 로직 테스트 완료 · 실차 미검증 |
 | 작업 배정 기본 규칙 (픽업대에 가장 가까운 로봇, 먼저 기다린 순) | 완료 · cost 고도화 진행 중 |
 | 관제 GUI (1대·2대, 도착 시간 예측, 실시간 지도) | 완료 |
 | 로봇 알림음 · 전방 근접 경고음 | 완료 |
@@ -200,7 +202,8 @@ PINKY_QT=6 python3 delivery_gui.py                      # PyQt6 사용 시
 
 ## 한계와 확장 방향
 
-- 통로 교통 관제는 없고, 로봇끼리 마주치면 각자의 Nav2 장애물 회피에 맡깁니다.
+- 공용 통로 전체를 예약하는 교통 관제는 아직 없습니다. 픽업대·작업대 잠금만으로 두 차의 충돌 회피를 보장할 수 없고, 각 차의 Nav2 장애물 회피도 별도 현장 검증이 필요합니다.
+- 실주행에는 측정한 지도 좌표와 두 HOME 주차 위치 파일, 두 차의 독립된 Nav2 action·AMCL 위치 토픽, 두 차의 위치 확인, `/delivery/arm`이 필요합니다. 물리적 비상 정지는 현장 담당자가 사용할 수 있어야 합니다.
 - 픽업대 차례를 기다리는 로봇은 그 자리에 멈추므로, 통로 한가운데서 기다릴 수 있습니다.
 - 대기열은 컨트롤러 메모리에만 있어 재시작하면 사라집니다.
 - 배터리·충전 관리, 고장 난 로봇의 작업을 다른 로봇으로 넘기는 기능은 없습니다.
