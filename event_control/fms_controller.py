@@ -30,7 +30,12 @@ ArUco docking (docking:=true): after Nav2 reaches STORE the controller calls
   {"distance": m, "angle_deg": deg, "visible": bool, "state": "running" | "done" | "failed"}
   "done" -> WAIT_LOAD, "failed" or dock_timeout -> ERROR.
 
-Who chooses which robot does what: task_allocation.py (assign, pickup_order).
+Who chooses which robot does what: task_allocation.py -> ../task_allocation/allocator.py.
+  Allocator.dispatch() picks, among free robots, the one with the lowest cost for each
+  request whose station is not locked; on 수령 완료 Allocator.next_for() hands the robot the
+  next assignable request (straight to the pickup, no trip home). Every robot's state, pose
+  and time in state are passed so the cost can include the other robot's pickup use.
+  Missing / failing allocator -> default rules (nearest free robot, first come first served).
 
 Parameters
   robots 'pinky_1,pinky_2' | dry_run false (fms_sim.py sets true) | map_frame 'map'
@@ -43,6 +48,7 @@ Parameters
                       0 = both use HOME itself)
   docking false | dock_start '/{robot}/delivery/dock_start' | dock_topic '/{robot}/delivery/dock'
   dock_timeout 60.0 s | dry_run_dock 2.0 s
+  avg_speed 0.15 m/s | t_loading 20.0 s | t_unloading 15.0 s | detour_factor 1.25 (allocation cost)
 
 Do not send competing goals from RViz while this controller is running.
 The FMS cancellation service is not a hardware e-stop; keep the physical stop available.
@@ -91,6 +97,7 @@ class Robot:
     def __init__(self, name):
         self.name = name
         self.state = 'IDLE'
+        self.state_since = time.monotonic()   # for allocation (remaining loading / unloading)
         self.current = None          # task being delivered
         self.target = None           # point name of the active/failed goal
         self.move_state = None       # state of the failed step (for retry)
@@ -134,6 +141,10 @@ class FmsController(Node):
         self.station_clearance = float(p('station_clearance', 0.2 if self.dry_run else 0.6))
         self.dock_timeout = float(p('dock_timeout', 60.0))
         self.dry_dock = float(p('dry_run_dock', 2.0))
+        self.avg_speed = float(p('avg_speed', 0.15))
+        self.t_loading = float(p('t_loading', 20.0))
+        self.t_unloading = float(p('t_unloading', 15.0))
+        self.detour = float(p('detour_factor', 1.25))
         nav_fmt = p('nav_action', '/{robot}/navigate_to_pose')
         pose_fmt = p('pose_topic', '/{robot}/amcl_pose')
         dock_start_fmt = p('dock_start', '/{robot}/delivery/dock_start')
@@ -249,6 +260,8 @@ class FmsController(Node):
         self.get_logger().info(f'[{r.name}] {text}')
 
     def set_state(self, r, state):
+        if state != r.state:
+            r.state_since = time.monotonic()
         r.state = state
         self.log(r, f'{state} | task={r.current}')
 
@@ -318,6 +331,39 @@ class FmsController(Node):
             return
         r.pose = (p.x, p.y)
         r.pose_seen = time.monotonic()
+
+    # ---------------------------------------------------- allocation inputs
+    def alloc_ctx(self):
+        return {'speed': self.avg_speed, 't_loading': self.t_loading, 't_unloading': self.t_unloading,
+                'detour': self.detour, 'pickup': self.pickup, 'home': self.home, 'docking': self.docking}
+
+    def can_take_task(self, r):
+        return (r.state == 'IDLE' and r.current is None and self.nav_ready(r)
+                and self.pose_ready(r) and not r.goal_pending and r.goal_handle is None
+                and r.stop_reason is None)
+
+    def robot_info(self, r, now):
+        """What the allocator sees for one robot (every robot, busy ones too)."""
+        return {'state': r.state, 'pose': r.pose, 'battery': None, 'current': r.current,
+                'target': r.target, 'free': self.can_take_task(r),
+                'elapsed': round(now - r.state_since, 2)}
+
+    def assignable(self):
+        """Queued requests whose station is not locked and is clear of robots."""
+        return [task for task in self.queue if self.station_owners[task['station']] is None
+                and self.station_area_clear(task['station'])]
+
+    def take_task(self, r, task):
+        """Give a queued request to r: lock its station and head for the pickup."""
+        self.queue.remove(task)
+        task = dict(task, robot=r.name)
+        self.station_owners[task['station']] = r.name
+        self.station_release_pending.discard(task['station'])
+        r.current = task
+        r.go_home_when_free = False
+        r.home_slot = None
+        self.log(r, f'Assigned {task}')
+        self.go_pickup(r)
 
     def publish_status(self):
         now = time.monotonic()
@@ -391,29 +437,17 @@ class FmsController(Node):
             self.publish_status()
             return
 
-        # 1) hand new requests to free robots (task_allocation.assign decides who)
-        free = {n: {'pose': r.pose, 'state': r.state} for n, r in self.robots.items()
-                if r.state == 'IDLE' and r.current is None and self.nav_ready(r)
-                and self.pose_ready(r) and not r.goal_pending and r.goal_handle is None
-                and r.stop_reason is None}
-        available = [task for task in self.queue if self.station_owners[task['station']] is None
-                     and self.station_area_clear(task['station'])]
+        # 1) hand new requests to free robots (task_allocation -> Allocator.dispatch decides who)
+        infos = {n: self.robot_info(r, now) for n, r in self.robots.items()}
+        free = {n for n, i in infos.items() if i['free']}
+        available = self.assignable()
         if available and free:
-            for name, task in task_allocation.assign(free, available, self.points):
+            for name, task in task_allocation.assign(infos, available, self.points, self.alloc_ctx()):
                 if name not in free or task not in self.queue \
                         or self.station_owners[task['station']] is not None:
                     continue
-                r = self.robots[name]
-                del free[name]
-                self.queue.remove(task)
-                task = dict(task, robot=name)
-                self.station_owners[task['station']] = name
-                self.station_release_pending.discard(task['station'])
-                r.current = task
-                r.go_home_when_free = False
-                r.home_slot = None
-                self.log(r, f'Assigned {task}')
-                self.go_pickup(r)
+                free.discard(name)
+                self.take_task(self.robots[name], task)
         elif self.queue and now - self.last_wait_log > 5.0 and not free:
             self.last_wait_log = now
             if not any(self.nav_ready(r) for r in self.robots.values()):
@@ -687,8 +721,19 @@ class FmsController(Node):
             r.departure_started_at = time.monotonic()
             r.current = None
             r.target = None
-            r.go_home_when_free = True      # next tick: new task, or back to the 수납대
-            self.set_state(r, 'IDLE')
+            # Allocator.next_for: take the next assignable request now, straight to the pickup
+            nxt = None
+            available = self.assignable() if self.armed and not self.shutting_down \
+                and self.nav_ready(r) and self.pose_ready(r) and not r.goal_pending \
+                and r.goal_handle is None and r.stop_reason is None else []
+            if available:
+                nxt = task_allocation.next_for(r.name, available, self.points, self.alloc_ctx())
+            if nxt is not None and nxt in available:
+                self.log(r, 'Next request right after delivery (no trip home)')
+                self.take_task(r, nxt)
+            else:
+                r.go_home_when_free = True      # next tick: new task, or back to the 수납대
+                self.set_state(r, 'IDLE')
         return response
 
     def retry(self, r, response):
