@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "entry_angle_deg": 45.0,
+  "exit_angle_deg": 135.0,
+  "entry_waypoint": [null, null],
+  "exit_waypoint": [null, null],
+  "corridor_axis": [[null, null], [null, null]],
+  "allow_same_direction_following": false,
+  "min_follow_distance": 1.0,
+  "heartbeat_timeout": 3.0,
+  "wait_timeout": 60.0
+}

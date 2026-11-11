@@ -124,6 +124,7 @@ STATE_STYLE = {
     'IDLE': ('대기 중', *GRAY),
     'TO_STORE': ('픽업 장소로 이동 중', *TEAL),
     'WAIT_PICKUP': ('픽업 차례 대기 · 다른 Pinky 적재 중', '#7F77DD', '#EEEDFE', '#3C3489'),
+    'WAIT_TRAFFIC': ('공용 통로 진입 대기', '#7F77DD', '#EEEDFE', '#3C3489'),
     'DOCKING': ('픽업대 마커에 맞추는 중', *TEAL),   # only if the controller adds this state
     'TO_STATION': ('작업대로 배달 중', *TEAL),
     'TO_HOME': ('수납 위치로 복귀 중', *TEAL),
@@ -1424,8 +1425,8 @@ class MainWindow(QWidget):
         for name in node.robot_names:
             self.pill_robot[name] = QLabel()
         self.pill_state = self.pill_robot[node.robot_names[0]]
-        self.pill_conn, self.lbl['nav'], self.lbl['mode'] = QLabel(), QLabel(), QLabel()
-        for p_ in list(self.pill_robot.values()) + [self.pill_conn, self.lbl['nav'], self.lbl['mode']]:
+        self.pill_conn, self.lbl['nav'], self.lbl['mode'], self.lbl['armed'] = QLabel(), QLabel(), QLabel(), QLabel()
+        for p_ in list(self.pill_robot.values()) + [self.pill_conn, self.lbl['nav'], self.lbl['mode'], self.lbl['armed']]:
             p_.setFixedHeight(26)
             header.addWidget(p_, 0, Qt.AlignVCenter)
 
@@ -1739,7 +1740,8 @@ class MainWindow(QWidget):
         tiles = QGridLayout()
         tiles.setSpacing(8)
         for i, (key, text) in enumerate((('target', '목적지'), ('dist', '남은 거리'),
-                                         ('timeout', '타임아웃까지'), ('pose', '위치 (x, y, θ)'))):
+                                         ('timeout', '타임아웃까지'), ('pose', '위치 (x, y, θ)'),
+                                         ('battery', '배터리'), ('cost', '배정 Cost'))):
             t = QFrame()
             t.setProperty('tile', True)
             tl_ = QVBoxLayout(t)
@@ -1765,14 +1767,18 @@ class MainWindow(QWidget):
         self.lbl['current'] = label('', 'muted')
         kl.addWidget(self.lbl['current'])
         br = QHBoxLayout()
+        self.btn_arm = QPushButton('시스템 활성화')
+        self.btn_disarm = QPushButton('운행 중지 요청')
         self.btn_retry = QPushButton('↻  재시도')
         self.btn_reset = QPushButton('✕  현재 작업 취소')
         self.btn_reset.setProperty('kind', 'danger')
         btn_rviz = QPushButton('RViz 열기')
+        self.btn_arm.clicked.connect(lambda: n.call('arm', 'FMS 활성화'))
+        self.btn_disarm.clicked.connect(lambda: n.call('disarm', 'FMS 운행 중지'))
         self.btn_retry.clicked.connect(lambda: n.call('retry', f'{self.selected} 재시도', robot=self.selected))
         self.btn_reset.clicked.connect(self.confirm_reset)
         btn_rviz.clicked.connect(self.open_rviz)
-        for b in (self.btn_retry, self.btn_reset, btn_rviz):
+        for b in (self.btn_arm, self.btn_disarm, self.btn_retry, self.btn_reset, btn_rviz):
             b.setCursor(Qt.PointingHandCursor)
             br.addWidget(b)
         kl.addLayout(br)
@@ -2166,6 +2172,11 @@ class MainWindow(QWidget):
         dry = f['dry_run']
         pill(self.lbl['mode'], '모드 -' if dry is None else ('모의 실행' if dry else '실물 주행'),
              *((AMBER[2], AMBER[1]) if dry else (GRAY[2], GRAY[1])))
+        armed = bool(st.get('armed'))
+        pill(self.lbl['armed'], 'FMS 활성' if armed else 'FMS 정지',
+             *((TEAL[2], TEAL[1]) if armed else (AMBER[2], AMBER[1])))
+        self.btn_arm.setEnabled(live and not armed)
+        self.btn_disarm.setEnabled(live and armed)
 
         # tab titles with attention dots
         states = {nm: rs.get('state') for nm, rs in robots.items()}
@@ -2349,7 +2360,8 @@ class MainWindow(QWidget):
         self.hero.setStyleSheet(
             f'QFrame[card="true"] {{ background:{soft}; border:1px solid {accent};'
             f' border-left:6px solid {accent}; border-radius:14px; }}')
-        step_of = {'DOCKING': 'TO_STORE', 'WAIT_PICKUP': 'TO_STORE'}
+        step_of = {'DOCKING': 'TO_STORE', 'WAIT_PICKUP': 'TO_STORE',
+                   'WAIT_TRAFFIC': g('move_state') or 'TO_STORE'}
         idx = next((i for i, (s_, _) in enumerate(STEPS) if s_ == step_of.get(state, state)), None)
         for i, lab in enumerate(self.step_labels):
             if idx is not None and i == idx:
@@ -2375,6 +2387,13 @@ class MainWindow(QWidget):
                                  f'{tr.pose[0]:.2f}, {tr.pose[1]:.2f}, {math.degrees(tr.pose[2]):.0f}°')
         self.lbl['pose_title'].setText(
             f'위치 (x, y, θ) · {tr.pose_source}' if tr.pose_source else '위치 (x, y, θ)')
+        battery = g('battery_percent')
+        self.lbl['battery'].setText(f'{battery * 100:.0f}%' if isinstance(battery, (int, float)) else '데이터 없음')
+        self.lbl['battery'].setStyleSheet(
+            f'color:{RED[2] if g("low_battery") else TEAL[2]}; font-size:18px; font-weight:700;')
+        cost = g('allocation_cost')
+        source = g('distance_source') or '-'
+        self.lbl['cost'].setText(f'{cost:.2f} · {source}' if isinstance(cost, (int, float)) else f'- · {source}')
         cur = g('current')
         self.lbl['current'].setText(f'현재 작업: {fmt_task(cur)}' if cur else '현재 작업 없음')
         err = g('error')

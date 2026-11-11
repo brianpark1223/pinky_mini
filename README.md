@@ -33,7 +33,8 @@ flowchart LR
     subgraph Laptop["관제 노트북"]
         GUI["관제 GUI<br/>delivery_gui.py"]
         FMS["FMS 컨트롤러<br/>fms_controller.py"]
-        ALLOC["작업 배정 규칙<br/>task_allocation/allocator.py"]
+        ALLOC["실시간 거리·전지 Cost<br/>task_allocation/allocator.py"]
+        TRAFFIC["공용 통로·작업대 잠금"]
     end
     subgraph P1["Pinky 1"]
         N1["Nav2"]
@@ -47,6 +48,7 @@ flowchart LR
     end
     GUI -- "요청 · 적재 · 수령 (서비스)" --> FMS
     FMS -- "누가 맡을지?" --> ALLOC
+    FMS <--> TRAFFIC
     FMS -- "상태 JSON (0.2초마다)" --> GUI
     FMS -- "목표 좌표" --> N1 & N2
     FMS -- "도킹 시작" --> D1 & D2
@@ -196,7 +198,8 @@ PINKY_QT=6 python3 delivery_gui.py                      # PyQt6 사용 시
 | 항목 | 상태 |
 |---|---|
 | 2대 FMS 컨트롤러 (로봇별 상태 머신, 픽업대·작업대 점유, 정지 확인, 오류 격리) | 로직 테스트 완료 · 실차 미검증 |
-| Cost 기반 작업 배정 (거리·대기 시간, 수령 후 다음 작업 연결) | 구현 · 모의 테스트 검증, 실차 미검증 |
+| Nav2 경로 거리 + 대기 시간 + 실시간 배터리 Cost 배정 및 연속 작업 | 로직·ROS 격리 테스트 완료 · 실차 토픽 미검증 |
+| 공용 통로 반대 방향 상호 배제, 같은 방향 안전거리, STORE/A/B 잠금 | 로직 테스트 완료 · 현장 좌표와 두 로봇 실차 검증 필요 |
 | 관제 GUI (1대·2대, 도착 시간 예측, 실시간 지도) | 완료 |
 | 로봇 알림음 · 전방 근접 경고음 | 완료 |
 | ArUco 도킹 노드 (컨트롤러 연결부는 완료) | 진행 중 |
@@ -204,11 +207,11 @@ PINKY_QT=6 python3 delivery_gui.py                      # PyQt6 사용 시
 
 ## 한계와 확장 방향
 
-- 공용 통로 전체를 예약하는 교통 관제는 아직 없습니다. 픽업대·작업대 잠금만으로 두 차의 충돌 회피를 보장할 수 없고, 각 차의 Nav2 장애물 회피도 별도 현장 검증이 필요합니다.
+- 공용 통로 예약과 작업대 잠금은 FMS에 연결되어 있지만, 실측 게이트 경유점 입력과 두 로봇 현장 검증이 필요합니다. Nav2 장애물 회피와 하드웨어 비상 정지를 대신하지 않습니다.
 - 실주행에는 측정한 지도 좌표와 두 HOME 주차 위치 파일, 두 차의 독립된 Nav2 action·AMCL 위치 토픽, 두 차의 위치 확인, `/delivery/arm`이 필요합니다. 물리적 비상 정지는 현장 담당자가 사용할 수 있어야 합니다.
 - 픽업대 차례를 기다리는 로봇은 그 자리에 멈추므로, 통로 한가운데서 기다릴 수 있습니다.
 - 대기열은 컨트롤러 메모리에만 있어 재시작하면 사라집니다.
-- 배터리·충전 관리, 고장 난 로봇의 작업을 다른 로봇으로 넘기는 기능은 없습니다.
+- 배터리는 새 작업 배정에 반영되고 저전량·임계 전량 보호도 적용됩니다. 자동 충전과 주행 중 작업 이관은 아직 없습니다.
 - 도착 시간에 사람이 싣고 꺼내는 시간은 포함하지 않습니다.
 
 ## RViz2 대화형 단일 로봇 미션
@@ -234,7 +237,7 @@ RViz `Publish Point`로 지정하는 네 지점은 `1 대기`, `2 픽업`, `3 �
 ```bash
 cd ~/dev_ws/ros
 source /opt/ros/jazzy/setup.bash
-colcon build --packages-select pinky_mission pinky_mission_panel --symlink-install
+./src/pinky_mini/scripts/build_project.sh
 
 cd src/pinky_mini
 ./start_pinky_mission.sh                  # 기본: 주행 차단

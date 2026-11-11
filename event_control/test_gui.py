@@ -525,6 +525,17 @@ ok(w.btn_retry.isEnabled() and '오류' in w.lbl_state.text(), 'ERROR enables re
 ok(not w.tabs.tabIcon(2).isNull() and w.tabs.tabIcon(1).isNull(), 'status tab dot on ERROR')
 ok(w.badge_load.text() == '완료', 'ERROR on way to station -> loaded done')
 shot(2, 'gui_error')
+# --- fleet safety controls and live cost telemetry
+status.update(armed=False, battery_percent=0.73, low_battery=False,
+              allocation_cost=4.25, distance_source='nav2_path')
+push(status)
+ok(w.btn_arm.isEnabled() and not w.btn_disarm.isEnabled(), 'disarmed status enables only FMS arm')
+ok(w.lbl['battery'].text() == '73%' and '4.25' in w.lbl['cost'].text()
+   and 'nav2_path' in w.lbl['cost'].text(), 'battery and allocation cost shown')
+w.btn_arm.click(); ok(CALLS[-1] == 'delivery/arm', 'GUI calls FMS arm service')
+status['armed'] = True; push(status)
+ok(not w.btn_arm.isEnabled() and w.btn_disarm.isEnabled(), 'armed status enables stop request')
+w.btn_disarm.click(); ok(CALLS[-1] == 'delivery/disarm', 'GUI calls FMS disarm service')
 # --- smoother pose: odometry between amcl updates, display smoothing
 import math as _m
 def _pm(x, y, yaw): return NS(pose=NS(pose=NS(position=NS(x=x, y=y), orientation=NS(x=0.0, y=0.0, z=_m.sin(yaw/2), w=_m.cos(yaw/2)))))

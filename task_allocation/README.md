@@ -11,8 +11,8 @@ Cᵢ = w_dist · clip(Dᵢ / D_max) + w_wait · clip(Wᵢ / W_max) + w_battery �
 
 - **Dᵢ**: 새 요청을 위해 픽업대(STORE)까지 가야 하는 총 주행 거리 [m]
 - **Wᵢ**: 멈춰 있는 시간 [s] (ArUco 정렬 + 픽업대 대기 + 지금 작업에서 남은 적재·수령 시간)
-- **Bᵢ**: 배터리. 배터리 관리를 안 하므로 `w_battery = 0`
-- `w_dist = 0.6`, `w_wait = 0.4`. `D_max`, `W_max`는 지점 좌표와 시간 설정으로 자동 계산
+- **Bᵢ**: `/<robot>/battery_state`에서 읽은 최신 배터리. 누락·시간 초과·저전량 로봇은 FMS가 후보에서 제외
+- `w_dist = 0.6`, `w_wait = 0.2`, `w_battery = 0.2`. FMS 파라미터로 조정하며 `D_max`, `W_max`는 자동 계산
 - cost 차이가 `tie_eps`(0.01) 이하면 동률로 보고 이름 순
 
 로봇 상태별로 비기까지 남은 일(설계 케이스 ①~⑤)은 `Allocator._remaining()`에 있습니다.
@@ -36,6 +36,8 @@ Cᵢ = w_dist · clip(Dᵢ / D_max) + w_wait · clip(Wᵢ / W_max) + w_battery �
 - `Config`의 시간·속도는 컨트롤러 파라미터를 씁니다: `v` ← `avg_speed`(0.15 m/s), `t_load_s` ← `t_loading`(20 s),
   `t_receive_s` ← `t_unloading`(15 s). 도킹을 끄면(`docking:=false`) `t_align_s = 0`. 나머지(가중치, `tie_eps` 등)는 `allocator.py` 값 그대로.
 - 거리 함수는 직선거리 × `detour_factor`(1.25).
+- 비어 있는 로봇의 STORE 거리는 `ComputePathToPose` 실제 경로를 우선하며 Planner가 없을 때만
+  상태에 `euclidean`을 표시한 AMCL 직선거리로 대체합니다.
 - 픽업대 순서(`pickup_order`)는 `allocator.py`에 없으므로 먼저 기다린 로봇부터(기본 규칙).
 
 ## 기본 규칙으로 넘어가는 경우
