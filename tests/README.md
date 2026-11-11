@@ -3,6 +3,7 @@
 현재 테스트는 `event_control/`에 있습니다. 해당 폴더에서 실행합니다.
 
 ```bash
+python3 -m unittest discover -s . -p test_sim.py
 python3 test_fms.py fms_controller.py
 python3 test_fsm.py parts_delivery.py
 python3 test_notifier.py robot_notifier.py

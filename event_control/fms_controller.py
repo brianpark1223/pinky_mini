@@ -4,7 +4,8 @@ One node manages every robot: one shared request queue, one pickup (STORE) used 
 one robot at a time, one shared HOME (수납대) with parking slots, and a state
 machine per robot. delivery_gui.py and robot_notifier.py read its status.
 
-Default dry_run:=true: virtual arrival after 2 seconds, no navigation goals.
+Default dry_run:=false: real mode (measured configuration and /delivery/arm required).
+For virtual arrivals without navigation goals, run fms_sim.py.
 Real mode: provide measured points_json/file and home_slots_json/file,
 start namespaced Nav2, localize both, then explicitly call /delivery/arm.
 
@@ -32,7 +33,7 @@ ArUco docking (docking:=true): after Nav2 reaches STORE the controller calls
 Who chooses which robot does what: task_allocation.py (assign, pickup_order).
 
 Parameters
-  robots 'pinky_1,pinky_2' | dry_run true | map_frame 'map'
+  robots 'pinky_1,pinky_2' | dry_run false (fms_sim.py sets true) | map_frame 'map'
   nav_action '/{robot}/navigate_to_pose' | pose_topic '/{robot}/amcl_pose'
   nav_timeout 90.0 s | dry_run_travel 2.0 s
   pose_timeout 3.0 s | cancel_timeout 5.0 s
@@ -119,7 +120,7 @@ class FmsController(Node):
     def __init__(self):
         super().__init__('fms_controller')
         p = lambda n, v: self.declare_parameter(n, v).value  # noqa: E731
-        self.dry_run = p('dry_run', True)
+        self.dry_run = p('dry_run', False)
         self.frame = p('map_frame', 'map')
         self.nav_timeout = float(p('nav_timeout', 90.0))
         self.dry_travel = float(p('dry_run_travel', 2.0))
@@ -781,13 +782,16 @@ class FmsController(Node):
                     f'[{r.name}] Nav2 stop unconfirmed at shutdown; use robot stop control')
 
 
-def main():
+def main(args=None):
     # Keep the ROS context alive after SIGINT/SIGTERM so Nav2 cancellation can be sent.
-    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     def terminate(_signum, _frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, terminate)
     node = FmsController()
+    if not node.dry_run:
+        node.get_logger().warn('REAL MODE: measured configuration and /delivery/arm are required. '
+                               'For simulation without motion: python3 fms_sim.py')
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

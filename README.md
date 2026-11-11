@@ -142,7 +142,8 @@ stateDiagram-v2
 ├── README.md
 ├── event_control/
 │   ├── README.md          # 실행법과 실제 팀 인터페이스
-│   ├── fms_controller.py  # 2대용 FMS 컨트롤러
+│   ├── fms_controller.py  # 2대용 FMS 컨트롤러 (실주행 모드)
+│   ├── fms_sim.py         # 같은 컨트롤러의 모의 실행 진입점
 │   ├── task_allocation.py # 외부 배정 모듈 연결 및 기본 규칙
 │   ├── parts_delivery.py  # 1대 시험용 컨트롤러
 │   ├── delivery_gui.py    # 관제 GUI
@@ -178,11 +179,11 @@ ArUco 도킹 노드는 아직 포함되지 않았으며, 시작 서비스와 피
 python3 robot_notifier.py --ros-args -p robot_name:=pinky_1   # 두 번째 로봇은 pinky_2
 
 # 관제 노트북 (로봇과 같은 ROS_DOMAIN_ID)
-python3 fms_controller.py                               # 모의 실행 (로봇이 움직이지 않음)
-python3 fms_controller.py --ros-args -p dry_run:=false \
+python3 fms_sim.py                                      # 모의 실행 (로봇이 움직이지 않음)
+python3 fms_controller.py --ros-args \
     -p points_file:=/absolute/path/to/measured_points.json \
     -p home_slots_file:=/absolute/path/to/measured_home_slots.json
-# 실주행은 별도 /delivery/arm 서비스 호출 전까지 시작되지 않음
+# 기본은 실주행 모드이며 좌표 파일 필수. 별도 /delivery/arm 전까지 출발하지 않음
 PINKY_QT=6 python3 delivery_gui.py                      # PyQt6 사용 시
 ```
 
